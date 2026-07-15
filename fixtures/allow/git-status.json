@@ -1,0 +1,1 @@
+{"name":"git-status","event":{"event_type":"tool.before","source":"test","agent_id":"main","session_key":"allow-01","tool":{"name":"exec","kind":"shell","input_kind":"bash"},"params":{"command":"git status"}},"expected":{"decision":"ALLOW","risk":"low","rule_ids":["GIT-READ-001"]},"allowed_log_fields":["event_id","derived","decision","risk","rule_ids","parameter_digest"]}

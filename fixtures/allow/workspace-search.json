@@ -1,0 +1,1 @@
+{"name":"workspace-search","event":{"event_type":"tool.before","source":"test","agent_id":"main","session_key":"allow-10","tool":{"name":"search","kind":"filesystem"},"params":{"path":"src","query":"TODO"}},"expected":{"decision":"ALLOW","risk":"low","rule_ids":["WORKSPACE-READ-001"]},"allowed_log_fields":["event_id","derived","decision","risk","rule_ids","parameter_digest"]}

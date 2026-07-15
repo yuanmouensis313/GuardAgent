@@ -1,0 +1,78 @@
+// Merge deliberately into the operator-owned OpenClaw configuration.
+// Replace every ${...} placeholder before use and validate with `openclaw doctor`.
+{
+  agents: {
+    defaults: {
+      sandbox: {
+        mode: "all",
+        scope: "session",
+        workspaceAccess: "rw",
+        docker: {
+          network: "none",
+          readOnlyRoot: true,
+        },
+        browser: {
+          enabled: true,
+          autoStart: true,
+          network: "openclaw-sandbox-browser",
+          allowHostControl: false,
+          binds: [],
+        },
+      },
+      subagents: { allowAgents: [], maxSpawnDepth: 1, maxChildrenPerAgent: 1 },
+    },
+    list: [
+      {
+        id: "main",
+        workspace: "${OPENCLAW_WORKSPACE}",
+        tools: {
+          allow: ["read", "write", "edit", "apply_patch", "exec", "process"],
+          deny: ["gateway", "cron", "sessions_spawn"],
+          elevated: { enabled: false },
+        },
+        subagents: { allowAgents: [] },
+      },
+    ],
+  },
+  tools: {
+    fs: { workspaceOnly: true },
+    exec: {
+      strictInlineEval: true,
+      applyPatch: { workspaceOnly: true },
+    },
+  },
+  plugins: {
+    enabled: true,
+    allow: ["guard-openclaw"],
+    entries: {
+      "guard-openclaw": {
+        enabled: true,
+        hooks: { timeoutMs: 500 },
+        config: {
+          serviceUrl: "http://127.0.0.1:8787",
+          tokenFile: "${GUARD_AGENT_TOKEN_FILE}",
+          workspaceRoot: "${OPENCLAW_WORKSPACE}",
+          timeoutMs: 400,
+          gatewayId: "local-gateway",
+          observeInputInjection: true,
+        },
+      },
+    },
+  },
+  security: {
+    installPolicy: {
+      enabled: true,
+      targets: ["skill", "plugin"],
+      exec: {
+        source: "exec",
+        command: "${ABSOLUTE_PYTHON_PATH}",
+        args: ["${ABSOLUTE_GUARD_REPO}/scripts/openclaw_install_policy.py", "--json"],
+        timeoutMs: 10000,
+        noOutputTimeoutMs: 10000,
+        maxOutputBytes: 1048576,
+        passEnv: ["GUARD_INSTALL_ALLOWLIST", "GUARD_INSTALL_LOCAL_ROOTS", "GUARD_INSTALL_REGISTRIES"],
+        trustedDirs: ["${ABSOLUTE_PYTHON_DIRECTORY}"],
+      },
+    },
+  },
+}

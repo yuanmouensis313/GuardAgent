@@ -1,0 +1,27 @@
+{
+  "id": "guard-openclaw",
+  "activation": {
+    "onStartup": true
+  },
+  "name": "GuardAgent OpenClaw Guard",
+  "description": "Fail-closed local policy enforcement and audit hooks for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["serviceUrl", "tokenFile", "workspaceRoot"],
+    "properties": {
+      "serviceUrl": {"type": "string", "pattern": "^https?://(?:127\\.0\\.0\\.1|localhost|\\[::1\\])(?::[0-9]+)?$"},
+      "tokenFile": {"type": "string", "minLength": 1},
+      "workspaceRoot": {"type": "string", "minLength": 1},
+      "timeoutMs": {"type": "integer", "minimum": 50, "maximum": 450},
+      "gatewayId": {"type": "string", "minLength": 1},
+      "observeInputInjection": {"type": "boolean"}
+    }
+  },
+  "uiHints": {
+    "tokenFile": {"label": "Bearer token file", "sensitive": true},
+    "serviceUrl": {"label": "guardd loopback URL"},
+    "workspaceRoot": {"label": "Authorized workspace root"},
+    "timeoutMs": {"label": "Decision timeout (ms)", "advanced": true}
+  }
+}

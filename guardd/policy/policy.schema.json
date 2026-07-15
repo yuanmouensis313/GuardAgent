@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "defaults", "rules"],
+  "properties": {
+    "version": {"const": 1},
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "decision", "on_parse_error", "on_service_error_high_risk"],
+      "properties": {
+        "mode": {"enum": ["observe", "approval", "enforce"]},
+        "decision": {"enum": ["allow", "deny", "require_approval", "observe"]},
+        "on_parse_error": {"enum": ["deny", "require_approval"]},
+        "on_service_error_high_risk": {"const": "deny"}
+      }
+    },
+    "protected_paths": {"type": "array", "items": {"type": "string"}},
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow_domains": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "deny_domains": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "secret_detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "detect_phone": {"type": "boolean"},
+        "detect_email": {"type": "boolean"},
+        "custom_patterns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "regex"],
+            "properties": {"id": {"type": "string", "minLength": 1}, "regex": {"type": "string", "minLength": 1}}
+          }
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tool_calls_per_10m": {"type": "integer", "minimum": 1},
+        "same_action_per_minute": {"type": "integer", "minimum": 1},
+        "subagents": {"type": "integer", "minimum": 0},
+        "files_per_operation": {"type": "integer", "minimum": 1},
+        "bytes_per_operation": {"type": "integer", "minimum": 1},
+        "delete_ratio": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "priority", "match", "decision", "risk", "reason"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Z0-9][A-Z0-9-]+$"},
+          "priority": {"type": "integer", "minimum": 0},
+          "match": {"type": "object", "minProperties": 1},
+          "decision": {"enum": ["allow", "deny", "require_approval", "observe"]},
+          "risk": {"enum": ["info", "low", "medium", "high", "critical"]},
+          "reason": {"type": "string", "minLength": 1},
+          "remediation": {"type": "string"},
+          "rewrite": {"type": "object"}
+        }
+      }
+    }
+  }
+}

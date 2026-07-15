@@ -1,0 +1,294 @@
+version: 1
+defaults:
+  mode: observe
+  decision: require_approval
+  on_parse_error: require_approval
+  on_service_error_high_risk: deny
+
+protected_paths:
+  - "${GUARD_AGENT_HOME}"
+  - "${GUARD_AGENT_STATE_DIR}"
+  - "${OPENCLAW_STATE_DIR}/exec-approvals.json"
+  - "${OPENCLAW_CONFIG}"
+
+network:
+  allow_domains:
+    - docs.openclaw.ai
+    - pypi.org
+    - files.pythonhosted.org
+    - registry.npmjs.org
+  deny_domains:
+    - evil.example
+
+secret_detection:
+  detect_phone: true
+  detect_email: false
+  custom_patterns: []
+
+budgets:
+  tool_calls_per_10m: 200
+  same_action_per_minute: 5
+  subagents: 3
+  files_per_operation: 100
+  bytes_per_operation: 50000000
+  delete_ratio: 0.5
+
+rules:
+  - id: PROMPT-INJECTION-001
+    priority: 2050
+    match: {event_type: agent.before, param_regex: '(ignore|disregard).{0,40}(previous|system).{0,100}(tool|shell|credential|policy)'}
+    decision: deny
+    risk: high
+    reason: "High-confidence prompt-injection pattern detected before agent execution"
+
+  - id: GUARD-SELF-PROTECT-001
+    priority: 2000
+    match: {action: [write, delete], path_group: guard_protected}
+    decision: deny
+    risk: critical
+    reason: "GuardAgent code, policy, state, and audit data are immutable to the monitored agent"
+
+  - id: SECURITY-CONFIG-PROTECT-001
+    priority: 1950
+    match: {action: [write, delete], command_regex: '(?i)(exec-approvals\.json|openclaw.*(?:sandbox|installPolicy|tool.*deny)|guardagent)'}
+    decision: deny
+    risk: critical
+    reason: "Security configuration modification is prohibited"
+
+  - id: ROOT-DELETE-001
+    priority: 1900
+    match: {action: delete, command_regex: '(?i)(rm\s+-(?:r|f|rf|fr)+\s+/(?:\s|$)|remove-item\s+(?:[A-Z]:\\|/)(?:\s|.*-(?:recurse|force))|del\s+/[sq]\s+[A-Z]:\\)'}
+    decision: deny
+    risk: critical
+    reason: "Root or drive-wide destructive deletion is prohibited"
+
+  - id: DOWNLOAD-EXEC-001
+    priority: 1880
+    match: {action: network_read, shell_feature: pipeline, command_regex: '(?i)(curl|wget|invoke-webrequest|iwr)'}
+    decision: deny
+    risk: critical
+    reason: "Download-to-execution pipelines are prohibited"
+
+  - id: ENCODED-COMMAND-001
+    priority: 1860
+    match: {dynamic_eval: true, command_regex: '(?i)(encodedcommand|frombase64string|base64\s+-d)'}
+    decision: deny
+    risk: critical
+    reason: "Encoded or obfuscated command execution is prohibited"
+
+  - id: PERSISTENCE-001
+    priority: 1840
+    match: {action: persistence}
+    decision: deny
+    risk: critical
+    reason: "Services, scheduled tasks, registry autoruns, and cron persistence are prohibited"
+
+  - id: CONTAINER-ESCAPE-001
+    priority: 1820
+    match: {action: container, command_regex: '(?i)(--privileged|/var/run/docker\.sock|/run/docker\.sock|--pid[= ]host|--network[= ]host|-[vV]\s+/(?:\s|:))'}
+    decision: deny
+    risk: critical
+    reason: "Privileged containers, host namespace sharing, and Docker socket mounts are prohibited"
+
+  - id: SECURITY-BYPASS-001
+    priority: 1800
+    match: {command_regex: '(?i)(security[= ]full|ask[= ]off|yolo|tools\.elevated|set-executionpolicy\s+(?:bypass|unrestricted)|disable.*(?:firewall|defender|antivirus|audit|logging))'}
+    decision: deny
+    risk: critical
+    reason: "Attempts to weaken native security controls are prohibited"
+
+  - id: CREDENTIAL-READ-001
+    priority: 1750
+    match: {action: read, path_group: sensitive_read_denied}
+    decision: deny
+    risk: critical
+    reason: "Credential stores, private keys, browser secrets, and environment secrets cannot be read"
+
+  - id: SENSITIVE-PATH-ACCESS-001
+    priority: 1760
+    match: {path_group: sensitive_read_denied}
+    decision: deny
+    risk: critical
+    reason: "Any access to credential and secret-bearing paths is prohibited"
+
+  - id: SECURITY-PATH-WRITE-001
+    priority: 1745
+    match: {action: [write, delete], path_group: sensitive_read_denied}
+    decision: deny
+    risk: critical
+    reason: "Credential and security state files cannot be modified"
+
+  - id: SECRET-EXFIL-001
+    priority: 1740
+    match: {action: [external_send, network_write], data_classification: ["*"]}
+    decision: deny
+    risk: critical
+    reason: "Sensitive data cannot be sent outside the local trust boundary"
+
+  - id: SENSITIVE-PATH-EXFIL-001
+    priority: 1735
+    match: {action: [external_send, network_write], path_group: sensitive_read_denied}
+    decision: deny
+    risk: critical
+    reason: "Credential or secret-bearing files cannot be uploaded or sent"
+
+  - id: EXTERNAL-WRITE-001
+    priority: 1700
+    match: {action: [write, delete], path_group: unknown_external, path_access: write}
+    decision: deny
+    risk: high
+    reason: "Writes outside configured workspaces are prohibited"
+
+  - id: EXTERNAL-PATH-ACCESS-001
+    priority: 1710
+    match: {path_group: unknown_external}
+    decision: deny
+    risk: high
+    reason: "Paths outside configured workspaces are prohibited"
+
+  - id: SYSTEM-PATH-001
+    priority: 1690
+    match: {action: [write, delete], path_group: system_protected}
+    decision: deny
+    risk: critical
+    reason: "System directories cannot be modified"
+
+  - id: SYSTEM-PATH-ACCESS-001
+    priority: 1695
+    match: {path_group: system_protected}
+    decision: deny
+    risk: critical
+    reason: "System paths are outside the agent trust boundary"
+
+  - id: DENIED-NETWORK-001
+    priority: 1650
+    match: {network_classification: denied}
+    decision: deny
+    risk: critical
+    reason: "The network destination is explicitly denied"
+
+  - id: DNS-BOUNDARY-001
+    priority: 1640
+    match: {network_classification: [unresolved, dns_private, invalid]}
+    decision: deny
+    risk: high
+    reason: "DNS failed or resolved the public name into a private/local address"
+
+  - id: DIRECT-IP-001
+    priority: 1600
+    match: {network_classification: direct_ip}
+    decision: deny
+    risk: high
+    reason: "Direct public IP access is not allowed"
+
+  - id: DYNAMIC-EVAL-001
+    priority: 1500
+    match: {dynamic_eval: true}
+    decision: require_approval
+    risk: high
+    reason: "Inline interpreter or nested shell execution requires one-time approval"
+
+  - id: PARSE-ERROR-001
+    priority: 1490
+    match: {parse_failed: true}
+    decision: require_approval
+    risk: high
+    reason: "Command could not be parsed reliably"
+
+  - id: GIT-PUSH-001
+    priority: 1450
+    match: {tool: exec, executable: git, argv_prefix: [push]}
+    decision: require_approval
+    risk: high
+    reason: "Remote repository writes require one-time approval"
+
+  - id: PACKAGE-INSTALL-001
+    priority: 1400
+    match: {action: install}
+    decision: require_approval
+    risk: medium
+    reason: "Dependency installation or upgrade requires one-time approval"
+
+  - id: UNKNOWN-DOMAIN-001
+    priority: 1380
+    match: {network_classification: new_public}
+    decision: require_approval
+    risk: high
+    reason: "A new public domain requires one-time approval"
+
+  - id: NETWORK-WRITE-001
+    priority: 1360
+    match: {network_direction: outbound_write}
+    decision: require_approval
+    risk: high
+    reason: "External network writes or uploads require one-time approval"
+
+  - id: MESSAGE-SEND-001
+    priority: 1340
+    match: {action: external_send}
+    decision: require_approval
+    risk: high
+    reason: "Outbound messages and attachments require one-time approval"
+
+  - id: PROCESS-CONTROL-001
+    priority: 1320
+    match: {action: process}
+    decision: require_approval
+    risk: high
+    reason: "Starting or stopping user processes requires one-time approval"
+
+  - id: SUBAGENT-SPAWN-001
+    priority: 1300
+    match: {tool: [sessions_spawn, subagent_spawn]}
+    decision: require_approval
+    risk: medium
+    reason: "Creating a subagent requires one-time approval"
+
+  - id: BROWSER-MUTATION-001
+    priority: 1280
+    match: {tool: browser, param_present: [submit, click, type, upload, payment]}
+    decision: require_approval
+    risk: high
+    reason: "Browser state changes require one-time approval"
+
+  - id: GIT-READ-001
+    priority: 500
+    match: {tool: exec, executable: git, argv_prefix_any: [[status], [diff], [log], [show]]}
+    decision: allow
+    risk: low
+    reason: "Read-only Git inspection is allowed"
+
+  - id: WORKSPACE-READ-001
+    priority: 450
+    match: {action: read, path_group: workspace_readwrite}
+    decision: allow
+    risk: low
+    reason: "Read-only access inside the configured workspace is allowed"
+
+  - id: WORKSPACE-WRITE-001
+    priority: 440
+    match: {action: write, path_group: workspace_readwrite}
+    decision: allow
+    risk: low
+    reason: "Ordinary source changes inside the configured workspace are allowed"
+
+  - id: LOOPBACK-001
+    priority: 420
+    match: {network_classification: loopback}
+    decision: allow
+    risk: low
+    reason: "Loopback service access is allowed"
+
+  - id: APPROVED-NETWORK-READ-001
+    priority: 410
+    match: {network_classification: approved_public, network_direction: outbound_read}
+    decision: allow
+    risk: low
+    reason: "Read-only access to approved public domains is allowed"
+
+  - id: HEALTH-001
+    priority: 400
+    match: {tool: [health, status, metadata]}
+    decision: allow
+    risk: info
+    reason: "Local metadata and health checks are allowed"
