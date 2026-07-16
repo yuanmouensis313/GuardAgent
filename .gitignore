@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+build/
+*.egg-info/
+plugins/guard-openclaw/node_modules/
+web/node_modules/
+web/.npm-cache/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+web/coverage/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+emergency.jsonl
+
+# Local build and validation artifacts
+.openclaw-validation-wheels/
+.openclaw-wheel-check/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

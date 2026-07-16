@@ -1,0 +1,27 @@
+{
+  "name": "@guardagent/guard-openclaw",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "OpenClaw typed hook adapter for GuardAgent",
+  "files": ["dist", "src", "openclaw.plugin.json"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.ts"],
+    "runtimeExtensions": ["./dist/index.js"],
+    "compat": {"pluginApi": ">=2026.5.27"}
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.27"
+  },
+  "devDependencies": {
+    "openclaw": "2026.7.1",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3",
+    "@types/node": "24.0.0"
+  }
+}

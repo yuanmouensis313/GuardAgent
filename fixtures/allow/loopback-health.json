@@ -1,0 +1,1 @@
+{"name":"loopback-health","event":{"event_type":"tool.before","source":"test","agent_id":"main","session_key":"allow-06","tool":{"name":"web_fetch","kind":"network"},"params":{"url":"http://127.0.0.1:8080/health"}},"expected":{"decision":"ALLOW","risk":"low","rule_ids":["LOOPBACK-001"]},"allowed_log_fields":["event_id","derived","decision","risk","rule_ids","parameter_digest"]}

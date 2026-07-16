@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import copy
+import tempfile
+import unittest
+from pathlib import Path
+
+import yaml
+from fastapi.testclient import TestClient
+
+from guardd.api import create_app
+from guardd.config import Settings
+from guardd.policy import PolicyLoader
+from guardd.security import ensure_token
+
+
+ROOT = Path(__file__).parents[2]
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        policy = copy.deepcopy(PolicyLoader().load(ROOT / "policies/default.yaml").document)
+        policy["defaults"]["mode"] = "enforce"
+        policy_path = root / "policy.yaml"
+        policy_path.write_text(yaml.safe_dump(policy, sort_keys=False), encoding="utf-8")
+        self.settings = Settings(state_dir=root / "state", policy_path=policy_path, workspace=workspace)
+        self.token = ensure_token(self.settings.token_path)
+        self.client_context = TestClient(create_app(self.settings))
+        self.client = self.client_context.__enter__()
+        self.auth = {"Authorization": f"Bearer {self.token}"}
+
+    def tearDown(self) -> None:
+        self.client_context.__exit__(None, None, None)
+        self.temp.cleanup()
+
+    def request(self, command: str) -> dict:
+        return {
+            "schema_version": "1.0", "request_id": "req-1",
+            "event": {
+                "event_type": "tool.before", "source": "test", "agent_id": "main", "session_key": "api",
+                "tool": {"name": "exec", "kind": "shell", "input_kind": "bash"},
+                "params": {"command": command},
+            },
+        }
+
+    def test_health_and_authentication(self) -> None:
+        self.assertEqual(self.client.get("/v1/health").status_code, 200)
+        self.assertEqual(self.client.get("/v1/status").status_code, 401)
+        status = self.client.get("/v1/status", headers=self.auth)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["database_integrity"], "ok")
+
+    def test_decision_and_approval_endpoints(self) -> None:
+        response = self.client.post("/v1/decisions/tool", headers=self.auth, json=self.request("git push origin main"))
+        self.assertEqual(response.status_code, 200)
+        decision = response.json()
+        self.assertEqual(decision["decision"], "REQUIRE_APPROVAL")
+        pending = self.client.get("/v1/approvals", headers=self.auth).json()
+        self.assertEqual(len(pending), 1)
+        resolution = self.client.post(
+            f"/v1/approvals/{decision['approval_id']}/allow-once", headers=self.auth,
+            json={"schema_version": "1.0", "request_id": "resolve", "operator": "test"},
+        )
+        self.assertEqual(resolution.status_code, 200)
+        self.assertEqual(resolution.json()["status"], "allowed_once")
+
+    def test_strict_content_type_and_schema(self) -> None:
+        response = self.client.post("/v1/decisions/tool", headers=self.auth, content="{}")
+        self.assertEqual(response.status_code, 415)
+        invalid = self.client.post("/v1/decisions/tool", headers=self.auth, json={"schema_version": "2.0"})
+        self.assertEqual(invalid.status_code, 422)
+        oversized = self.client.post(
+            "/v1/decisions/tool", headers={**self.auth, "Content-Type": "application/json"},
+            content=b" " * (self.settings.request_limit_bytes + 1),
+        )
+        self.assertEqual(oversized.status_code, 413)
+
+    def test_policy_validate_and_simulate(self) -> None:
+        policy_text = self.settings.policy_path.read_text(encoding="utf-8")
+        validation = self.client.post("/v1/policy/validate", headers=self.auth, json={"schema_version": "1.0", "request_id": "v", "policy": policy_text})
+        self.assertTrue(validation.json()["valid"])
+        simulation = self.client.post("/v1/policy/simulate", headers=self.auth, json=self.request("rm -rf /"))
+        self.assertEqual(simulation.json()["decision"], "DENY")
+
+
+if __name__ == "__main__":
+    unittest.main()
