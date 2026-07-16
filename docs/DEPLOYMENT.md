@@ -82,9 +82,20 @@ guardctl approvals deny <uuid>
 guardctl policy simulate fixtures/deny/root-delete-posix.json
 guardctl policy test fixtures/deny/root-delete-posix.json
 guardctl replay --session <hashed-session>
+guardctl ui
 ```
 
 Approvals expire after 60 seconds by default, are single-use, and bind agent, session, sender, tool, parameters, cwd, normalized paths, and network targets. Critical decisions never offer an approval path. OpenClaw plugin approvals offer only `allow-once` and `deny`.
+
+### Local visual console
+
+Run `guardctl ui` from a trusted local operator terminal. The command verifies `guardd`, creates a 60-second single-use bootstrap code, and opens the loopback-only console. Use `guardctl ui --no-open` when the environment cannot launch a browser.
+
+The console provides overview metrics, live approval handling, event and session timelines, candidate-policy validation/simulation/regression, atomic policy publishing and rollback, incidents, diagnostics, and read-only settings. Browser writes require an HttpOnly UI session, a per-session CSRF token, and an allowed loopback Origin. The bearer token remains in the protected state directory and is not copied into the browser.
+
+If the UI build is unavailable, `/ui/` returns 503 while `/v1/*`, the plugin, and all existing CLI operations continue to work. UI sessions and pending approvals are invalidated by a service restart.
+
+Set `GUARDD_UI_ENABLED=false` before starting `guardd` to disable the browser control plane entirely. Machine APIs and the OpenClaw plugin remain available; `/ui/` returns 503 and `/v1/ui/*` is not registered.
 
 ## 7. Failure behavior
 

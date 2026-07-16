@@ -1,15 +1,24 @@
 # GuardAgent 可视化管理界面详细实现方案
 
-> 文档状态：设计稿，尚未开始编码
+> 文档状态：首版已实现，作为实现与验收基线
 > 基线版本：GuardAgent 0.1.0
-> 编写日期：2026-07-15
+> 编写日期：2026-07-16
 > 适用范围：本仓库现有 `guardd`、策略文件、SQLite 审计库与 OpenClaw 插件
 
 ## 1. 文档目的
 
 本文档描述如何在不破坏现有命令行、OpenClaw 插件和安全边界的前提下，为 GuardAgent 增加本地可视化管理界面。文档覆盖产品范围、技术选型、页面与交互、后端接口、数据结构、安全模型、代码组织、实施阶段、测试和验收标准，可直接作为后续开发依据。
 
-本阶段只产出设计文档，不实施前端、接口、数据库迁移或依赖变更。
+首版已按本文档落地前端、UI API、数据库迁移、安全认证、策略工作台和自动化测试；尚需真实 OpenClaw Gateway 的目标环境验收仍以部署文档为准。
+
+### 1.1 当前实现证据（2026-07-16）
+
+- Python：69 项通过，1 项因 Windows 进程缺少符号链接权限跳过；
+- Web：TypeScript 严格检查通过，Vitest 9 项通过，Vite 生产构建通过；
+- OpenClaw 插件：TypeScript 严格检查通过，9 项测试通过；
+- 最新 Web 构建约 441 KB gzip，七个页面按路由拆分，无 CDN、遥测或远程字体；
+- `guardd/ui/static/` 已于 2026-07-16 由当前 `web/` 源码完成生产构建并纳入交付内容；后续修改 `web/src/` 时仍须执行 `cd web && npm run build`；
+- 真实 Gateway 联调、3–7 天 Observe 运行和目标主机浏览器验收属于部署门槛，不由仓库自动化测试替代。
 
 ## 2. 目标与非目标
 
@@ -383,6 +392,7 @@ sequenceDiagram
 | GET | `/v1/ui/policy/revisions` | 策略历史 |
 | POST | `/v1/ui/policy/revisions/{id}/restore` | 校验后回滚 |
 | POST | `/v1/ui/diagnostics/jobs` | 启动 doctor job |
+| GET | `/v1/ui/diagnostics/jobs` | 获取最近诊断历史 |
 | GET | `/v1/ui/diagnostics/jobs/{id}` | 获取诊断状态/结果 |
 | GET | `/v1/ui/incidents` | 服务事故列表 |
 | GET | `/v1/ui/settings` | 只读设置 |
@@ -587,7 +597,7 @@ CREATE INDEX idx_incidents_created ON service_incidents(created_at DESC);
 
 对 `/ui/*` 返回：
 
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`；
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' 'nonce-{request_nonce}'; style-src-elem 'self' 'nonce-{request_nonce}'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; worker-src 'self' blob:`；其中脚本仍严格禁止 inline/eval，逐请求 nonce 仅供 CodeMirror 动态样式元素使用，`style-src-attr` 仅兼容本地组件尺寸属性；
 - `X-Content-Type-Options: nosniff`；
 - `Referrer-Policy: no-referrer`；
 - `Cache-Control: no-store` 用于认证和敏感 API；

@@ -55,3 +55,28 @@ jobs:
       - name: Verify committed runtime files are current
         working-directory: .
         run: git diff --exit-code -- plugins/guard-openclaw/dist
+
+  web:
+    name: Web console (Node.js 22)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+      - name: Type-check
+        run: npm run lint
+      - name: Test
+        run: npm test
+      - name: Build production console
+        run: npm run build
+      - name: Verify committed console files are current
+        working-directory: .
+        run: git diff --exit-code -- guardd/ui/static

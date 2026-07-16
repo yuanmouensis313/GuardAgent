@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import webbrowser
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from urllib.parse import quote
+from uuid import UUID, uuid4
 
 import httpx
 import typer
@@ -44,6 +46,29 @@ def status_command() -> None:
         response = client.get("/v1/status")
         response.raise_for_status()
         _print(response.json())
+
+
+@app.command("ui")
+def ui_command(no_open: bool = typer.Option(False, "--no-open", help="Print the secure local UI URL without opening a browser")) -> None:
+    """Create a short-lived local UI session and open the GuardAgent console."""
+    settings = _settings()
+    with _client() as client:
+        health = client.get("/v1/health")
+        health.raise_for_status()
+        response = client.post(
+            "/v1/ui/auth/bootstrap",
+            json={"schema_version": "1.0", "request_id": f"guardctl-ui-{uuid4()}"},
+        )
+        response.raise_for_status()
+        code = response.json()["code"]
+    url = f"http://{settings.host}:{settings.port}/ui/#/bootstrap?code={quote(code, safe='')}"
+    if no_open:
+        typer.echo(url)
+        return
+    if not webbrowser.open(url, new=2):
+        typer.echo(url)
+        raise typer.Exit(1)
+    typer.echo(f"GuardAgent UI opened at http://{settings.host}:{settings.port}/ui/")
 
 
 @events_app.command("list")

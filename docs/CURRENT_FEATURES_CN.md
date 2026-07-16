@@ -376,7 +376,7 @@ Windows 真实 junction 测试在当前测试进程中因缺少创建权限被�
 
 数据库写入异常时，高风险行为不会因为审计失败而自动放行；高风险决策会转为拒绝，并在可能的情况下写入应急 JSONL。
 
-当前已提供一致性备份脚本，但审计自动留存清理和应急 JSONL 自动回灌尚未完成，详见“未完成事项”。
+当前已提供一致性备份脚本，并会在服务启动时按 `audit_retention_days` 清理过期审计记录；应急 JSONL 在数据库恢复后的自动去重回灌尚未完成，详见“未完成事项”。
 
 ## 16. 本地 API
 
@@ -556,15 +556,17 @@ break-glass 只停用 GuardAgent，不会自动把 OpenClaw 改成 YOLO、full a
 - 10,000 事件性能与有界状态测试；
 - TypeScript 插件测试；
 - OpenClaw SDK 严格类型编译；
-- 插件 runtime 构建验证。
+- 插件 runtime 构建验证；
+- Web 控制台 TypeScript、组件测试和生产构建验证。
 
 最近一次完整验证记录为：
 
-- Python：48 个通过，1 个跳过；
+- Python：69 个通过，1 个跳过；
 - 跳过项：当前 Windows 进程没有真实 symlink/junction 创建权限；
 - TypeScript 插件：9 个测试通过；
 - TypeScript strict checking 通过；
 - 插件 runtime build 通过；
+- Web 控制台：9 个测试、TypeScript strict checking 和 Vite production build 通过；
 - 10,000 次本地确定性决策 P50 约 0.713 ms；
 - 10,000 次本地确定性决策 P95 约 0.892 ms；
 - 100 并发决策 P95 约 12.439 ms；
@@ -602,15 +604,32 @@ Python 测试覆盖：
 
 详细验证记录见 `docs/IMPLEMENTATION_STATUS.md`。
 
+### 20.5 本地可视化控制台
+
+仓库现已包含 `web/` 下的 React/TypeScript 前端和 `guardd/api/ui/` 下的操作者 API。生产构建由同一个只监听回环地址的 FastAPI 进程通过 `/ui/` 提供，不改变 OpenClaw 插件使用的 `/v1/*` 机器接口。
+
+界面提供：
+
+- 服务状态、决策/风险趋势、Top 规则和待审批总览；
+- 带服务端校准倒计时的一次性审批，且只支持 `allow-once`/`deny`；
+- 事件组合过滤、脱敏详情、工具结果和审计哈希；
+- 会话聚合、时间线、脱敏导出和策略重放；
+- YAML 策略编辑、校验、安全差异、dry-run、fixtures 回归、原子发布、历史 revision 和回滚；
+- 后台 doctor 诊断、服务事故与只读运行设置。
+
+`guardctl ui` 通过 bearer 认证创建 60 秒单次 bootstrap code。code 位于 URL fragment，浏览器消费后只获得 HttpOnly、SameSite=Strict 的短期 UI session；所有写操作还需 CSRF token 和回环 Origin 校验。bearer token 不进入浏览器 URL、localStorage 或响应内容。
+
+UI 静态资源缺失、SSE 断线或诊断任务失败不会影响插件判定接口。SSE 断线时界面自动使用短轮询刷新审批和状态。
+
+设置 `GUARDD_UI_ENABLED=false` 可完全停用浏览器控制面；此时 `/ui/` 返回 503、`/v1/ui/*` 不注册，但机器 API、CLI 与 OpenClaw 插件继续工作。
+
 ## 23. 当前尚未完成或尚未证明的事项
 
 以下内容不能标记为生产完成：
 
 ### 23.1 需要继续开发
 
-- `audit_retention_days` 已有配置，但数据库自动留存清理尚未实现；
 - 应急 `emergency.jsonl` 在数据库恢复后的自动去重回灌尚未实现；
-- 策略更新前的独立自动备份流程尚未完整闭环；
 - 插件异步队列饱和的专门压力测试仍需补充；
 - 外部进程长期占用 SQLite 写锁后的恢复测试仍需补充；
 - 终端 `guardctl allow-once` 与正在等待的 OpenClaw 原生调用之间需要真实 Gateway 联调并明确恢复语义。
@@ -657,6 +676,9 @@ Python 测试覆盖：
 | `docs/IMPLEMENTATION_STATUS.md` | 实现证据和外部验收门禁 |
 | `guardd/service.py` | 核心服务编排 |
 | `guardd/api/app.py` | 本地 FastAPI |
+| `guardd/api/ui/` | 可视化控制台认证与操作者 API |
+| `guardd/ui/static/` | 已构建的本地控制台静态资源 |
+| `web/` | React/TypeScript 可视化界面源码 |
 | `guardd/policy/engine.py` | 策略匹配和决策 |
 | `guardd/correlation.py` | 跨调用关联和预算 |
 | `guardd/audit/store.py` | SQLite 审计 |

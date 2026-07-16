@@ -29,6 +29,7 @@ guardctl = "guardd.cli:app"
 include = ["guardd*"]
 
 [tool.setuptools.package-data]
+guardd = ["ui/static/**/*"]
 "guardd.policy" = ["policy.schema.json"]
 
 [tool.pytest.ini_options]

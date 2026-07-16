@@ -42,11 +42,23 @@ git diff --exit-code -- dist
 
 The generated `dist/` runtime files are committed. Update them whenever `src/` changes.
 
+Run the web-console checks:
+
+```powershell
+cd web
+npm run lint
+npm test
+npm run build
+git diff --exit-code -- ../guardd/ui/static
+```
+
+The generated `guardd/ui/static/` production console is committed. Update it whenever `web/src/` changes.
+
 ## Change workflow
 
 1. Create a focused branch such as `feat/policy-rule` or `fix/audit-redaction`.
 2. Keep commits narrow and use a clear prefix such as `feat:`, `fix:`, `docs:`, or `test:`.
-3. Add tests for policy, normalization, approval, audit, or degraded-mode behavior changes.
+3. Add tests for policy, normalization, approval, audit, degraded-mode, API, or web-console behavior changes.
 4. Update deployment and implementation-status documentation when operational behavior changes.
 5. Open a pull request and wait for all required checks to pass.
 

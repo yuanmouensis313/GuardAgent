@@ -12,6 +12,18 @@ def _default_state_dir() -> Path:
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "guardagent"
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str = "127.0.0.1"
@@ -23,6 +35,7 @@ class Settings:
     approval_ttl_seconds: int = 60
     audit_retention_days: int = 30
     plugin_timeout_ms: int = 400
+    ui_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -39,6 +52,7 @@ class Settings:
             approval_ttl_seconds=max(1, min(int(os.getenv("GUARDD_APPROVAL_TTL", "60")), 600)),
             audit_retention_days=int(os.getenv("GUARDD_RETENTION_DAYS", "30")),
             plugin_timeout_ms=int(os.getenv("GUARDD_PLUGIN_TIMEOUT_MS", "400")),
+            ui_enabled=_env_bool("GUARDD_UI_ENABLED", True),
         )
 
     @property

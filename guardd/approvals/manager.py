@@ -51,7 +51,6 @@ class ApprovalManager:
         return approval_id
 
     def list(self, pending_only: bool = True) -> list[dict[str, Any]]:
-        self.expire()
         sql = "SELECT * FROM approvals"
         if pending_only:
             sql += " WHERE status='pending'"
