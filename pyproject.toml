@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.3,<9", "pytest-cov>=6,<7"]
+test = ["pytest>=8.3,<9", "pytest-cov>=6,<8"]
 
 [project.scripts]
 guardd = "guardd.main:main"
