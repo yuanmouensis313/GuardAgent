@@ -15,13 +15,21 @@
       "workspaceRoot": {"type": "string", "minLength": 1},
       "timeoutMs": {"type": "integer", "minimum": 50, "maximum": 450},
       "gatewayId": {"type": "string", "minLength": 1},
-      "observeInputInjection": {"type": "boolean"}
+      "observeInputInjection": {"type": "boolean"},
+      "captureTaskPolicy": {"type": "boolean"},
+      "sanitizationMode": {"type": "string", "enum": ["disabled", "observe", "enforce"], "default": "observe"},
+      "contentInspectionMode": {"type": "string", "enum": ["disabled", "observe", "enforce"], "default": "observe"},
+      "skillRoots": {"type": "array", "items": {"type": "string"}, "maxItems": 32}
     }
   },
   "uiHints": {
     "tokenFile": {"label": "Bearer token file", "sensitive": true},
     "serviceUrl": {"label": "guardd loopback URL"},
     "workspaceRoot": {"label": "Authorized workspace root"},
-    "timeoutMs": {"label": "Decision timeout (ms)", "advanced": true}
+    "timeoutMs": {"label": "Decision timeout (ms)", "advanced": true},
+    "captureTaskPolicy": {"label": "Capture session task policy objectives", "advanced": true},
+    "sanitizationMode": {"label": "Data-path sanitization", "help": "Observe records detections; enforce transforms tool data and blocks unsafe outbound secrets."},
+    "contentInspectionMode": {"label": "Skill/MCP inspection", "help": "Enforce fails closed for uninspected content identities."},
+    "skillRoots": {"label": "Skill roots", "help": "Optional directories whose direct child Skills are rescanned at Gateway startup.", "advanced": true}
   }
 }

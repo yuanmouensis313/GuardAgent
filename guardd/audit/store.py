@@ -29,7 +29,9 @@ CREATE INDEX IF NOT EXISTS idx_events_routing ON events(agent_id, tool_name, occ
 CREATE TABLE IF NOT EXISTS decisions (
   decision_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, decision TEXT NOT NULL,
   would_decide TEXT, risk TEXT NOT NULL, reason TEXT NOT NULL, parameter_digest TEXT NOT NULL,
-  mode TEXT NOT NULL, policy_digest TEXT NOT NULL, created_at TEXT NOT NULL
+  mode TEXT NOT NULL, policy_digest TEXT NOT NULL, created_at TEXT NOT NULL,
+  task_policy_digest TEXT, task_policy_revision INTEGER, task_policy_verdict TEXT,
+  content_verdict_digest TEXT, transformation_digest TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_event ON decisions(event_id);
 CREATE TABLE IF NOT EXISTS rule_matches (
@@ -78,6 +80,49 @@ CREATE TABLE IF NOT EXISTS diagnostic_runs (
   job_id TEXT PRIMARY KEY, operator TEXT NOT NULL, status TEXT NOT NULL,
   result_json TEXT, started_at TEXT NOT NULL, completed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS task_policies (
+  task_policy_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, agent_id TEXT NOT NULL,
+  revision INTEGER NOT NULL, status TEXT NOT NULL, source_digest TEXT NOT NULL,
+  policy_digest TEXT NOT NULL, base_policy_digest TEXT NOT NULL,
+  objective_json TEXT NOT NULL, policy_json TEXT NOT NULL, generator_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, activated_at TEXT, expires_at TEXT NOT NULL, closed_at TEXT,
+  UNIQUE(session_key, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_task_policies_session_status ON task_policies(session_key, status, revision DESC);
+CREATE TABLE IF NOT EXISTS task_policy_confirmations (
+  confirmation_id INTEGER PRIMARY KEY AUTOINCREMENT, task_policy_id TEXT NOT NULL,
+  operator TEXT NOT NULL, decision TEXT NOT NULL, candidate_digest TEXT NOT NULL,
+  previous_digest TEXT, diff_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_confirmations_policy ON task_policy_confirmations(task_policy_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS sanitization_events (
+  sanitizer_event_id TEXT PRIMARY KEY, direction TEXT NOT NULL, session_key TEXT NOT NULL,
+  tool_name TEXT NOT NULL, tool_call_id TEXT, classifications_json TEXT NOT NULL,
+  transformations_json TEXT NOT NULL, original_size INTEGER NOT NULL, result_size INTEGER NOT NULL,
+  truncated INTEGER NOT NULL, blocked INTEGER NOT NULL, pattern_digest TEXT, content_digest TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sanitization_session_created ON sanitization_events(session_key, created_at DESC);
+CREATE TABLE IF NOT EXISTS content_artifacts (
+  artifact_id TEXT PRIMARY KEY, kind TEXT NOT NULL, canonical_name TEXT NOT NULL,
+  source_identity TEXT NOT NULL, content_digest TEXT NOT NULL, manifest_json TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+  UNIQUE(kind, source_identity, content_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_content_artifacts_digest ON content_artifacts(content_digest, last_seen_at DESC);
+CREATE TABLE IF NOT EXISTS inspection_verdicts (
+  verdict_id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL, status TEXT NOT NULL,
+  decision TEXT NOT NULL, risk TEXT NOT NULL, scanner_version TEXT NOT NULL,
+  inspection_policy_digest TEXT NOT NULL, llm_reviewer_json TEXT,
+  findings_json TEXT NOT NULL, capability_manifest_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inspection_artifact_created ON inspection_verdicts(artifact_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS content_confirmations (
+  confirmation_id TEXT PRIMARY KEY, verdict_id TEXT NOT NULL, operator TEXT NOT NULL,
+  decision TEXT NOT NULL, scope TEXT NOT NULL, session_key TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_content_confirmations_verdict ON content_confirmations(verdict_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_occurred_event ON events(occurred_at DESC, event_id DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_risk_created ON decisions(risk, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_kind_created ON decisions(decision, created_at DESC);
@@ -94,6 +139,7 @@ class AuditStore:
         self._event_sink: Callable[[str, dict[str, Any]], None] | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._backup_before_ui_migration()
+        self._backup_before_schema_migration()
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
@@ -102,8 +148,29 @@ class AuditStore:
         self._connection.execute("PRAGMA foreign_keys=ON")
         try:
             self._connection.executescript(SCHEMA)
+            self._ensure_column("decisions", "task_policy_digest", "TEXT")
+            self._ensure_column("decisions", "task_policy_revision", "INTEGER")
+            self._ensure_column("decisions", "task_policy_verdict", "TEXT")
+            self._ensure_column("decisions", "content_verdict_digest", "TEXT")
+            self._ensure_column("decisions", "transformation_digest", "TEXT")
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
+                (self._now(),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
+                (self._now(),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+                (self._now(),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
+                (self._now(),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)",
                 (self._now(),),
             )
             self._connection.commit()
@@ -113,7 +180,9 @@ class AuditStore:
                 pass
         except sqlite3.Error:
             self._connection.close()
-            backup = self.path.with_name(f"{self.path.name}.pre-ui-v1.bak")
+            backup = self.path.with_name(f"{self.path.name}.pre-schema-v5.bak")
+            if not backup.is_file():
+                backup = self.path.with_name(f"{self.path.name}.pre-ui-v1.bak")
             if backup.is_file():
                 shutil.copy2(backup, self.path)
             raise
@@ -133,6 +202,27 @@ class AuditStore:
             backup.chmod(0o600)
         except OSError:
             pass
+
+    def _backup_before_schema_migration(self) -> None:
+        if not self.path.is_file():
+            return
+        backup = self.path.with_name(f"{self.path.name}.pre-schema-v5.bak")
+        if backup.exists():
+            return
+        shutil.copy2(self.path, backup)
+        for suffix in ("-wal", "-shm"):
+            companion = Path(f"{self.path}{suffix}")
+            if companion.is_file():
+                shutil.copy2(companion, Path(f"{backup}{suffix}"))
+        try:
+            backup.chmod(0o600)
+        except OSError:
+            pass
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row[1] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self) -> None:
         with self._lock:
@@ -154,7 +244,7 @@ class AuditStore:
 
     def record_event(self, event: GuardEvent) -> None:
         clean, _ = sanitize(event.model_dump(mode="json"), extra_patterns=self.secret_patterns)
-        clean["params"] = summarize_mapping(event.params)
+        clean["params"] = summarize_mapping(clean.get("params", {}))
         for command in clean.get("derived", {}).get("commands", []):
             if not isinstance(command, dict):
                 continue
@@ -183,10 +273,15 @@ class AuditStore:
         try:
             with self._lock, self._connection:
                 self._connection.execute(
-                    "INSERT OR REPLACE INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO decisions("
+                    "decision_id, event_id, decision, would_decide, risk, reason, parameter_digest, mode, policy_digest, created_at, "
+                    "task_policy_digest, task_policy_revision, task_policy_verdict, content_verdict_digest, transformation_digest"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (str(decision.decision_id), str(decision.event_id), decision.decision.value,
                      decision.would_decide.value if decision.would_decide else None, decision.risk,
-                     decision.reason, decision.parameter_digest, decision.effective_mode, policy_digest, self._now()),
+                     decision.reason, decision.parameter_digest, decision.effective_mode, policy_digest, self._now(),
+                     decision.task_policy_digest, decision.task_policy_revision, decision.task_policy_verdict,
+                     decision.content_verdict_digest, decision.transformation_digest),
                 )
                 self._connection.executemany(
                     "INSERT OR IGNORE INTO rule_matches VALUES (?, ?)",
@@ -207,6 +302,168 @@ class AuditStore:
                  result.duration_ms, json.dumps(output_summary, ensure_ascii=False, default=str), result.error, self._now()),
             )
 
+    def record_sanitization_event(self, event: Any) -> None:
+        document = event.model_dump(mode="json")
+        clean, _ = sanitize(document, extra_patterns=self.secret_patterns)
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO sanitization_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.sanitizer_event_id, event.direction, event.session_key, event.tool_name,
+                    event.tool_call_id, json.dumps(clean["classifications"], ensure_ascii=False),
+                    json.dumps(clean["transformations"], ensure_ascii=False), event.original_size,
+                    event.result_size, int(event.truncated), int(event.blocked), event.pattern_digest,
+                    event.content_digest, self._now(),
+                ),
+            )
+
+    def list_sanitization_events(self, session_key: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM sanitization_events"
+        args: list[Any] = []
+        if session_key:
+            sql += " WHERE session_key=?"
+            args.append(session_key)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(min(max(limit, 1), 500))
+        with self._lock:
+            rows = [dict(row) for row in self._connection.execute(sql, args).fetchall()]
+        for row in rows:
+            row["classifications"] = self._json(row.pop("classifications_json"), [])
+            row["transformations"] = self._json(row.pop("transformations_json"), [])
+            row["truncated"] = bool(row["truncated"])
+            row["blocked"] = bool(row["blocked"])
+        return rows
+
+    def sanitization_metrics(self) -> dict[str, int]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT count(*) AS total, sum(blocked) AS blocked, sum(truncated) AS truncated, "
+                "sum(original_size) AS original_size, sum(result_size) AS result_size FROM sanitization_events",
+            ).fetchone()
+        return {key: int(row[key] or 0) for key in row.keys()}
+
+    def record_content_inspection(self, artifact: Any, verdict: Any) -> tuple[str, str]:
+        artifact_document, _ = sanitize(artifact.model_dump(mode="json"), extra_patterns=self.secret_patterns)
+        verdict_document, _ = sanitize(verdict.model_dump(mode="json"), extra_patterns=self.secret_patterns)
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT artifact_id, first_seen_at FROM content_artifacts WHERE kind=? AND source_identity=? AND content_digest=?",
+                (artifact.kind, artifact_document["source_identity"], artifact.content_digest),
+            ).fetchone()
+            artifact_id = existing["artifact_id"] if existing else str(artifact.artifact_id)
+            if existing:
+                self._connection.execute(
+                    "UPDATE content_artifacts SET canonical_name=?, manifest_json=?, last_seen_at=? WHERE artifact_id=?",
+                    (
+                        artifact_document["canonical_name"],
+                        json.dumps(artifact_document["manifest"], ensure_ascii=False),
+                        artifact.last_seen_at.isoformat(), artifact_id,
+                    ),
+                )
+            else:
+                self._connection.execute(
+                    "INSERT INTO content_artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        artifact_id, artifact.kind, artifact_document["canonical_name"], artifact_document["source_identity"],
+                        artifact.content_digest, json.dumps(artifact_document["manifest"], ensure_ascii=False),
+                        artifact.first_seen_at.isoformat(), artifact.last_seen_at.isoformat(),
+                    ),
+                )
+            verdict_id = str(verdict.verdict_id)
+            self._connection.execute(
+                "INSERT INTO inspection_verdicts VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (
+                    verdict_id, artifact_id, verdict.status, verdict.decision.value, verdict.risk,
+                    verdict.scanner_version, verdict.inspection_policy_digest,
+                    json.dumps(verdict_document["findings"], ensure_ascii=False),
+                    json.dumps(verdict_document["capability_manifest"], ensure_ascii=False),
+                    verdict.created_at.isoformat(), verdict.expires_at.isoformat() if verdict.expires_at else None,
+                ),
+            )
+        return artifact_id, verdict_id
+
+    def get_cached_inspection(
+        self, kind: str, source_identity: str, content_digest: str,
+        scanner_version: str, inspection_policy_digest: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT v.* FROM inspection_verdicts v JOIN content_artifacts a ON a.artifact_id=v.artifact_id "
+                "WHERE a.kind=? AND a.source_identity=? AND a.content_digest=? AND v.scanner_version=? "
+                "AND v.inspection_policy_digest=? AND v.status='valid' ORDER BY v.created_at DESC LIMIT 1",
+                (kind, source_identity, content_digest, scanner_version, inspection_policy_digest),
+            ).fetchone()
+        return self._inspection_verdict_row(row) if row else None
+
+    def _inspection_verdict_row(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["findings"] = self._json(item.pop("findings_json"), [])
+        item["capability_manifest"] = self._json(item.pop("capability_manifest_json"), {})
+        item["llm_reviewer"] = self._json(item.pop("llm_reviewer_json"), None)
+        return item
+
+    def get_inspection(self, content_digest: str) -> dict[str, Any] | None:
+        with self._lock:
+            artifact = self._connection.execute(
+                "SELECT * FROM content_artifacts WHERE content_digest=? ORDER BY last_seen_at DESC LIMIT 1",
+                (content_digest,),
+            ).fetchone()
+            if artifact is None:
+                return None
+            verdict = self._connection.execute(
+                "SELECT * FROM inspection_verdicts WHERE artifact_id=? ORDER BY created_at DESC LIMIT 1",
+                (artifact["artifact_id"],),
+            ).fetchone()
+            confirmations = [dict(row) for row in self._connection.execute(
+                "SELECT c.* FROM content_confirmations c JOIN inspection_verdicts v ON v.verdict_id=c.verdict_id "
+                "WHERE v.artifact_id=? ORDER BY c.created_at DESC",
+                (artifact["artifact_id"],),
+            ).fetchall()]
+        item = dict(artifact)
+        item["manifest"] = self._json(item.pop("manifest_json"), {})
+        item["verdict"] = self._inspection_verdict_row(verdict)
+        item["confirmations"] = confirmations
+        return item
+
+    def list_inspections(self, kind: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT a.*, v.verdict_id, v.status AS verdict_status, v.decision, v.risk, v.scanner_version, "
+            "v.inspection_policy_digest, v.created_at AS inspected_at, v.expires_at "
+            "FROM content_artifacts a LEFT JOIN inspection_verdicts v ON v.verdict_id=("
+            "SELECT verdict_id FROM inspection_verdicts WHERE artifact_id=a.artifact_id ORDER BY created_at DESC LIMIT 1)"
+        )
+        args: list[Any] = []
+        if kind:
+            sql += " WHERE a.kind=?"
+            args.append(kind)
+        sql += " ORDER BY a.last_seen_at DESC LIMIT ?"
+        args.append(min(max(limit, 1), 500))
+        with self._lock:
+            rows = [dict(row) for row in self._connection.execute(sql, args).fetchall()]
+        for row in rows:
+            row["manifest"] = self._json(row.pop("manifest_json"), {})
+        return rows
+
+    def record_content_confirmation(
+        self, confirmation_id: str, verdict_id: str, operator: str,
+        decision: str, scope: str, session_key: str | None,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO content_confirmations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (confirmation_id, verdict_id, operator, decision, scope, session_key, self._now()),
+            )
+
+    def invalidate_inspection(self, content_digest: str) -> int:
+        with self._lock, self._connection:
+            return self._connection.execute(
+                "UPDATE inspection_verdicts SET status='stale', decision='STALE' WHERE artifact_id IN "
+                "(SELECT artifact_id FROM content_artifacts WHERE content_digest=?) AND status='valid'",
+                (content_digest,),
+            ).rowcount
+
     def list_events(self, session: str | None = None, risk: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT e.*, d.decision, d.risk, d.reason FROM events e LEFT JOIN decisions d ON d.event_id=e.event_id WHERE 1=1"
         args: list[Any] = []
@@ -223,7 +480,12 @@ class AuditStore:
 
     def replay_events(self, session: str) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._connection.execute("SELECT sanitized_json FROM events WHERE session_key=? ORDER BY occurred_at", (session,)).fetchall()
+            rows = self._connection.execute(
+                "SELECT e.sanitized_json FROM events e "
+                "WHERE e.session_key=? AND EXISTS (SELECT 1 FROM decisions d WHERE d.event_id=e.event_id) "
+                "ORDER BY e.occurred_at",
+                (session,),
+            ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def status_counts(self) -> dict[str, int]:
@@ -233,7 +495,252 @@ class AuditStore:
                 "decisions": self._connection.execute("SELECT count(*) FROM decisions").fetchone()[0],
                 "pending_approvals": self._connection.execute("SELECT count(*) FROM approvals WHERE status='pending'").fetchone()[0],
                 "incidents": self._connection.execute("SELECT count(*) FROM service_incidents").fetchone()[0],
+                "active_task_policies": self._connection.execute("SELECT count(*) FROM task_policies WHERE status='active'").fetchone()[0],
+                "pending_task_policies": self._connection.execute("SELECT count(*) FROM task_policies WHERE status IN ('candidate', 'revision_candidate')").fetchone()[0],
             }
+
+    @staticmethod
+    def _task_policy_from_row(row: sqlite3.Row | None) -> Any:
+        if row is None:
+            return None
+        from guardd.task_policy.models import TaskPolicy
+
+        payload = json.loads(row["policy_json"])
+        payload.update({
+            "status": row["status"],
+            "activated_at": row["activated_at"],
+            "closed_at": row["closed_at"],
+        })
+        return TaskPolicy.model_validate(payload)
+
+    def record_task_policy(self, policy: Any) -> None:
+        document = policy.model_dump(mode="json")
+        clean, _ = sanitize(document, extra_patterns=self.secret_patterns)
+        # These are already one-way structural identifiers. Generic secret
+        # detection must not rewrite them or the persisted policy can no longer
+        # pass its schema/digest checks on reload.
+        for field in ("task_policy_id", "session_key", "agent_id", "policy_digest", "base_policy_digest"):
+            clean[field] = document[field]
+        clean["objective"]["source_digest"] = document["objective"]["source_digest"]
+        clean["provenance"]["prompt_digest"] = document["provenance"]["prompt_digest"]
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO task_policies(task_policy_id, session_key, agent_id, revision, status, source_digest, "
+                "policy_digest, base_policy_digest, objective_json, policy_json, generator_json, created_at, activated_at, expires_at, closed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(policy.task_policy_id), policy.session_key, policy.agent_id, policy.revision,
+                    policy.status.value, policy.objective.source_digest, policy.policy_digest,
+                    policy.base_policy_digest, json.dumps(clean["objective"], ensure_ascii=False),
+                    json.dumps(clean, ensure_ascii=False), json.dumps(clean["provenance"], ensure_ascii=False),
+                    policy.created_at.isoformat(), None, policy.limits.expires_at.isoformat(), None,
+                ),
+            )
+
+    def latest_task_policy_revision(self, session_key: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT max(revision) FROM task_policies WHERE session_key=?", (session_key,),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def get_task_policy(self, session_key: str, status: str | None = None) -> Any:
+        sql = "SELECT * FROM task_policies WHERE session_key=?"
+        args: list[Any] = [session_key]
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY revision DESC LIMIT 1"
+        with self._lock:
+            row = self._connection.execute(sql, args).fetchone()
+        return self._task_policy_from_row(row)
+
+    def get_pending_task_policy(self, session_key: str) -> Any:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM task_policies WHERE session_key=? AND status IN ('candidate', 'revision_candidate') "
+                "ORDER BY revision DESC LIMIT 1",
+                (session_key,),
+            ).fetchone()
+        return self._task_policy_from_row(row)
+
+    def supersede_pending_task_policies(self, session_key: str) -> int:
+        with self._lock, self._connection:
+            return self._connection.execute(
+                "UPDATE task_policies SET status='superseded', closed_at=? "
+                "WHERE session_key=? AND status IN ('candidate', 'revision_candidate')",
+                (self._now(), session_key),
+            ).rowcount
+
+    def list_task_policies(self, session_key: str, limit: int = 100) -> list[Any]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM task_policies WHERE session_key=? ORDER BY revision DESC LIMIT ?",
+                (session_key, min(max(limit, 1), 500)),
+            ).fetchall()
+        return [self._task_policy_from_row(row) for row in rows]
+
+    def list_task_policy_confirmations(self, session_key: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT c.confirmation_id, c.task_policy_id, c.operator, c.decision, c.candidate_digest, "
+                "c.previous_digest, c.diff_json, c.created_at FROM task_policy_confirmations c "
+                "JOIN task_policies p ON p.task_policy_id=c.task_policy_id "
+                "WHERE p.session_key=? ORDER BY c.confirmation_id DESC LIMIT ?",
+                (session_key, min(max(limit, 1), 500)),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["diff"] = self._json(item.pop("diff_json"), {})
+            result.append(item)
+        return result
+
+    def task_policy_usage(self, session_key: str, activated_at: datetime) -> dict[str, Any]:
+        """Count calls that reached execution after the selected policy revision became active."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT e.sanitized_json, d.decision, tr.event_id AS has_result "
+                "FROM events e JOIN decisions d ON d.event_id=e.event_id "
+                "LEFT JOIN tool_results tr ON tr.event_id=e.event_id "
+                "WHERE e.session_key=? AND e.event_type='tool.before' AND e.occurred_at>=? "
+                "ORDER BY e.occurred_at",
+                (session_key, activated_at.isoformat()),
+            ).fetchall()
+        tool_calls = 0
+        external_writes = 0
+        files_changed: set[str] = set()
+        for row in rows:
+            if row["decision"] != "ALLOW" and row["has_result"] is None:
+                continue
+            event = self._json(row["sanitized_json"], {})
+            tool_calls += 1
+            derived = event.get("derived", {})
+            if any(item.get("direction") == "outbound_write" for item in derived.get("network_targets", [])):
+                external_writes += 1
+            for item in derived.get("paths", []):
+                if item.get("access") == "write" and item.get("resolved"):
+                    files_changed.add(str(item["resolved"]))
+        return {
+            "tool_calls": tool_calls,
+            "external_writes": external_writes,
+            "files_changed": sorted(files_changed),
+        }
+
+    def activate_task_policy(
+        self, *, session_key: str, candidate_digest: str,
+        expected_active_revision: int | None, operator: str,
+        base_policy_digest: str,
+    ) -> Any:
+        now = self._now()
+        with self._lock, self._connection:
+            candidate = self._connection.execute(
+                "SELECT * FROM task_policies WHERE session_key=? AND status IN ('candidate', 'revision_candidate') AND policy_digest=? ORDER BY revision DESC LIMIT 1",
+                (session_key, candidate_digest),
+            ).fetchone()
+            if candidate is None or candidate["base_policy_digest"] != base_policy_digest:
+                return None
+            active = self._connection.execute(
+                "SELECT * FROM task_policies WHERE session_key=? AND status='active' ORDER BY revision DESC LIMIT 1",
+                (session_key,),
+            ).fetchone()
+            active_revision = int(active["revision"]) if active else None
+            if active_revision != expected_active_revision:
+                return None
+            previous_digest = active["policy_digest"] if active else None
+            if active:
+                self._connection.execute(
+                    "UPDATE task_policies SET status='superseded', closed_at=? WHERE task_policy_id=?",
+                    (now, active["task_policy_id"]),
+                )
+            self._connection.execute(
+                "UPDATE task_policies SET status='active', activated_at=? WHERE task_policy_id=? AND status IN ('candidate', 'revision_candidate')",
+                (now, candidate["task_policy_id"]),
+            )
+            self._connection.execute(
+                "INSERT INTO task_policy_confirmations(task_policy_id, operator, decision, candidate_digest, previous_digest, diff_json, created_at) "
+                "VALUES (?, ?, 'activate', ?, ?, ?, ?)",
+                (candidate["task_policy_id"], operator, candidate_digest, previous_digest,
+                 json.dumps({"from_revision": active_revision, "to_revision": candidate["revision"]}), now),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM task_policies WHERE task_policy_id=?", (candidate["task_policy_id"],),
+            ).fetchone()
+        return self._task_policy_from_row(row)
+
+    def reject_task_policy(self, session_key: str, candidate_digest: str, operator: str) -> Any:
+        now = self._now()
+        with self._lock, self._connection:
+            candidate = self._connection.execute(
+                "SELECT * FROM task_policies WHERE session_key=? AND status IN ('candidate', 'revision_candidate') AND policy_digest=? ORDER BY revision DESC LIMIT 1",
+                (session_key, candidate_digest),
+            ).fetchone()
+            if candidate is None:
+                return None
+            self._connection.execute(
+                "UPDATE task_policies SET status='rejected', closed_at=? WHERE task_policy_id=?",
+                (now, candidate["task_policy_id"]),
+            )
+            self._connection.execute(
+                "INSERT INTO task_policy_confirmations(task_policy_id, operator, decision, candidate_digest, previous_digest, diff_json, created_at) "
+                "VALUES (?, ?, 'reject', ?, NULL, '{}', ?)",
+                (candidate["task_policy_id"], operator, candidate_digest, now),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM task_policies WHERE task_policy_id=?", (candidate["task_policy_id"],),
+            ).fetchone()
+        return self._task_policy_from_row(row)
+
+    def close_task_policies(self, session_key: str, operator: str) -> int:
+        now = self._now()
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                "SELECT task_policy_id, policy_digest FROM task_policies WHERE session_key=? AND status IN ('candidate', 'revision_candidate', 'active')",
+                (session_key,),
+            ).fetchall()
+            if not rows:
+                return 0
+            self._connection.execute(
+                "UPDATE task_policies SET status='closed', closed_at=? WHERE session_key=? AND status IN ('candidate', 'revision_candidate', 'active')",
+                (now, session_key),
+            )
+            self._connection.executemany(
+                "INSERT INTO task_policy_confirmations(task_policy_id, operator, decision, candidate_digest, previous_digest, diff_json, created_at) "
+                "VALUES (?, ?, 'close', ?, NULL, '{}', ?)",
+                [(row["task_policy_id"], operator, row["policy_digest"], now) for row in rows],
+            )
+            return len(rows)
+
+    def close_child_task_policies(self, parent_session_key: str, operator: str) -> int:
+        now = self._now()
+        with self._lock, self._connection:
+            candidates = self._connection.execute(
+                "SELECT task_policy_id, policy_digest, policy_json FROM task_policies "
+                "WHERE status IN ('candidate', 'revision_candidate', 'active')",
+            ).fetchall()
+            rows = [
+                row for row in candidates
+                if self._json(row["policy_json"], {}).get("parent_session_key") == parent_session_key
+            ]
+            if not rows:
+                return 0
+            self._connection.executemany(
+                "UPDATE task_policies SET status='closed', closed_at=? WHERE task_policy_id=?",
+                [(now, row["task_policy_id"]) for row in rows],
+            )
+            self._connection.executemany(
+                "INSERT INTO task_policy_confirmations(task_policy_id, operator, decision, candidate_digest, previous_digest, diff_json, created_at) "
+                "VALUES (?, ?, 'parent_close', ?, NULL, '{}', ?)",
+                [(row["task_policy_id"], operator, row["policy_digest"], now) for row in rows],
+            )
+            return len(rows)
+
+    def expire_task_policy(self, task_policy_id: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE task_policies SET status='expired', closed_at=? WHERE task_policy_id=? AND status='active'",
+                (self._now(), task_policy_id),
+            )
 
     def integrity_check(self) -> str:
         with self._lock:

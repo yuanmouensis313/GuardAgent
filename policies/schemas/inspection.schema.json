@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guardagent.local/schemas/inspection.schema.json",
+  "title": "GuardAgent content inspection",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["artifact_id", "kind", "canonical_name", "source_identity", "content_digest", "manifest", "verdict"],
+  "properties": {
+    "artifact_id": {"type": "string", "format": "uuid"},
+    "kind": {"enum": ["skill", "mcp"]},
+    "canonical_name": {"type": "string"},
+    "source_identity": {"type": "string"},
+    "content_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "manifest": {"type": "object"},
+    "verdict": {
+      "type": "object", "additionalProperties": true,
+      "required": ["verdict_id", "status", "decision", "risk", "scanner_version", "inspection_policy_digest", "findings", "capability_manifest"],
+      "properties": {
+        "verdict_id": {"type": "string", "format": "uuid"},
+        "status": {"enum": ["valid", "stale"]},
+        "decision": {"enum": ["ALLOW", "REQUIRE_APPROVAL", "DENY", "QUARANTINE", "STALE"]},
+        "risk": {"enum": ["info", "low", "medium", "high", "critical"]},
+        "scanner_version": {"type": "string"},
+        "inspection_policy_digest": {"type": "string"},
+        "findings": {"type": "array"},
+        "capability_manifest": {"type": "object"}
+      }
+    }
+  }
+}

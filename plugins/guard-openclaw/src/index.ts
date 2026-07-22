@@ -1,11 +1,49 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readdir } from "node:fs/promises";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { GuardClient, configFor, unifiedEvent } from "./client.js";
+import { GuardClient, configFor, hashLocal, unifiedEvent } from "./client.js";
 import { emergencyDecision } from "./emergency.js";
+import { sanitizeToolMessage, sanitizeValue, type SanitizationResult } from "./sanitizer.js";
+import { SANITIZATION_PATTERN_DIGEST } from "./generated-sanitization-patterns.js";
 import type { GuardConfig, GuardDecision, HookEvent } from "./types.js";
 
 const clients = new Map<string, GuardClient>();
 const calls = new Map<string, string>();
+const parentSessions = new Map<string, string>();
+const startupInspectionErrors = new Map<string, string>();
+
+const configKey = (config: GuardConfig) => `${config.serviceUrl}\n${config.tokenFile}`;
+
+function contentDigest(value: unknown): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(value) ?? String(value)).digest("hex")}`;
+}
+
+async function inspectSkillPath(client: GuardClient, sourcePath: string, name: string, sourceIdentity: string) {
+  return client.request<Record<string, unknown>>("/v1/inspections/skill", {
+    schema_version: "1.0", request_id: randomUUID(), source_path: sourcePath,
+    canonical_name: name, source_identity: sourceIdentity.slice(0, 512), builtin_findings: [],
+  });
+}
+
+async function scanConfiguredSkillRoots(client: GuardClient, config: GuardConfig): Promise<void> {
+  for (const root of (config.skillRoots ?? []).slice(0, 32)) {
+    const entries = await readdir(root, { withFileTypes: true });
+    for (const entry of entries.slice(0, 500)) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const inspected = await inspectSkillPath(client, `${root}/${entry.name}`, entry.name, `gateway-root:${root}`);
+      const effective = String(inspected.effective_decision ?? (inspected.verdict as Record<string, unknown> | undefined)?.decision ?? "QUARANTINE");
+      if (config.contentInspectionMode === "enforce" && effective !== "ALLOW") {
+        throw new Error(`skill ${entry.name} is not admitted (${effective})`);
+      }
+    }
+  }
+}
+
+function withParent(ctx: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const session = String(ctx?.sessionKey ?? ctx?.sessionId ?? "");
+  const parentSessionKey = session ? parentSessions.get(session) : undefined;
+  return parentSessionKey ? { ...ctx, parentSessionKey } : ctx;
+}
 
 function clientFor(config: GuardConfig): GuardClient {
   const key = `${config.serviceUrl}\n${config.tokenFile}`;
@@ -17,9 +55,9 @@ function clientFor(config: GuardConfig): GuardClient {
   return client;
 }
 
-function approvalResult(decision: GuardDecision, client: GuardClient) {
+function approvalResult(decision: GuardDecision, client: GuardClient, params?: Record<string, unknown>) {
   return {
-    ...(decision.rewritten_params ? { params: decision.rewritten_params } : {}),
+    ...(params ? { params } : {}),
     requireApproval: {
       title: `GuardAgent: ${decision.rule_ids[0] ?? "policy review"}`.slice(0, 80),
       description: `${decision.reason} [risk=${decision.risk}; approval=${decision.approval_id ?? "n/a"}]`.slice(0, 512),
@@ -36,6 +74,39 @@ function approvalResult(decision: GuardDecision, client: GuardClient) {
       },
     },
   };
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function executionView(
+  decision: GuardDecision,
+  raw: Record<string, unknown>,
+  local: SanitizationResult<Record<string, unknown>>,
+  config: GuardConfig,
+): { params?: Record<string, unknown>; blockReason?: string } {
+  if (decision.execution_params && decision.rewritten_params && !sameJson(decision.execution_params, decision.rewritten_params)) {
+    return { blockReason: "GuardAgent returned conflicting execution_params and rewritten_params" };
+  }
+  const serviceParams = decision.execution_params ?? decision.rewritten_params ?? undefined;
+  const actions = new Set((decision.transformation_plan ?? []).map((item) => item.action));
+  if (local.classifications.length && config.sanitizationMode === "enforce") {
+    const planned = new Set((decision.transformation_plan ?? []).map((item) => item.classification));
+    if (!local.classifications.every((item) => planned.has(item))) {
+      return { blockReason: "GuardAgent transformation plan does not cover every locally detected classification" };
+    }
+    if (actions.has("block") || actions.has("require_approval")) {
+      return { blockReason: "GuardAgent blocked secret-bearing execution parameters" };
+    }
+    if (serviceParams) {
+      return { blockReason: "A policy rewrite cannot safely reconstruct locally held secret values" };
+    }
+    if (actions.has("redact") || actions.has("drop")) return { params: local.value };
+    if (actions.has("preserve")) return { params: raw };
+    return { blockReason: "Secret-bearing parameters have no explicit execution transformation" };
+  }
+  return serviceParams ? { params: serviceParams } : {};
 }
 
 function emergencyResult(event: HookEvent, config: GuardConfig, outbound = false) {
@@ -55,8 +126,31 @@ function emergencyResult(event: HookEvent, config: GuardConfig, outbound = false
 }
 
 async function beforeTool(event: HookEvent, ctx: Record<string, unknown> | undefined, config: GuardConfig) {
+  ctx = withParent(ctx);
   const client = clientFor(config);
-  const normalized = unifiedEvent(event, ctx, "tool.before", config);
+  const startupInspectionError = startupInspectionErrors.get(configKey(config));
+  if (config.contentInspectionMode === "enforce" && startupInspectionError) {
+    return { block: true, blockReason: startupInspectionError };
+  }
+  if (event.contentKind === "skill" && typeof event.contentSourcePath === "string") {
+    try {
+      const inspected = await inspectSkillPath(
+        client, event.contentSourcePath, String(event.contentName ?? "unknown-skill"), "runtime-skill",
+      );
+      event = { ...event, contentDigest: String(inspected.content_digest ?? "") };
+      const effective = String(inspected.effective_decision ?? (inspected.verdict as Record<string, unknown> | undefined)?.decision ?? "QUARANTINE");
+      if (config.contentInspectionMode === "enforce" && effective !== "ALLOW") {
+        return { block: true, blockReason: `GuardAgent skill inspection verdict is ${effective}` };
+      }
+    } catch {
+      if (config.contentInspectionMode === "enforce") return { block: true, blockReason: "GuardAgent runtime skill reinspection failed closed" };
+    }
+  }
+  const rawParams = event.params ?? {};
+  const local = sanitizeValue(rawParams) as SanitizationResult<Record<string, unknown>>;
+  const normalized = unifiedEvent(event, ctx, "tool.before", config, {
+    params: local.value, classifications: local.classifications,
+  });
   const eventId = String(normalized.event_id);
   const toolCallId = String(event.toolCallId ?? ctx?.toolCallId ?? "");
   if (toolCallId) {
@@ -66,18 +160,49 @@ async function beforeTool(event: HookEvent, ctx: Record<string, unknown> | undef
   try {
     const decision = await client.decide(normalized);
     if (decision.decision === "DENY") return { block: true, blockReason: decision.reason };
-    if (decision.decision === "REQUIRE_APPROVAL") return approvalResult(decision, client);
-    return decision.rewritten_params ? { params: decision.rewritten_params } : undefined;
+    if (decision.rule_ids.includes("TASK-POLICY-PENDING-001")) {
+      const digest = decision.task_policy_digest?.slice(0, 16) ?? "unknown";
+      const revision = decision.task_policy_revision ?? "unknown";
+      return {
+        block: true,
+        blockReason: `${decision.reason} [R_task revision=${revision}; digest=${digest}; run guardctl task-policy approve --session <session> --digest <full-digest>, then retry]`,
+      };
+    }
+    const execution = executionView(decision, rawParams, local, config);
+    if (execution.blockReason) return { block: true, blockReason: execution.blockReason };
+    if (decision.decision === "REQUIRE_APPROVAL") return approvalResult(decision, client, execution.params);
+    return execution.params ? { params: execution.params } : undefined;
   } catch {
+    if (config.sanitizationMode === "enforce" && local.classifications.length) {
+      return { block: true, blockReason: "GuardAgent sanitization unavailable for secret-bearing tool parameters" };
+    }
     return emergencyResult(event, config);
   }
 }
 
 async function outboundDecision(event: HookEvent, ctx: Record<string, unknown> | undefined, payload: Record<string, unknown>, config: GuardConfig) {
+  ctx = withParent(ctx);
   const client = clientFor(config);
-  const outboundEvent = unifiedEvent(event, ctx, "message.before", config, { toolName: "message_send", params: payload });
+  const local = sanitizeValue(payload) as SanitizationResult<Record<string, unknown>>;
+  const outboundEvent = unifiedEvent(event, ctx, "message.before", config, {
+    toolName: "message_send", params: local.value, classifications: local.classifications,
+  });
+  if ((config.sanitizationMode ?? "observe") !== "disabled" && local.classifications.length) {
+    client.observe("/v1/events/sanitization", {
+      schema_version: "1.0", request_id: randomUUID(), sanitizer_event_id: randomUUID(),
+      direction: "outbound", session_key: hashLocal(ctx?.sessionKey) ?? "local:unknown",
+      tool_name: "message_send", classifications: local.classifications,
+      transformations: local.transformations, original_size: local.original_size,
+      result_size: local.result_size, truncated: local.truncated,
+      blocked: config.sanitizationMode === "enforce",
+      pattern_digest: SANITIZATION_PATTERN_DIGEST, content_digest: contentDigest(local.value),
+    });
+  }
   try {
     const decision = await client.decide(outboundEvent, true);
+    if (config.sanitizationMode === "enforce" && local.classifications.length) {
+      return { cancel: true, cancelReason: "GuardAgent blocked secret-bearing outbound content", metadata: { classifications: local.classifications } };
+    }
     if (decision.decision === "DENY" || decision.decision === "REQUIRE_APPROVAL") {
       return { cancel: true, cancelReason: decision.reason, metadata: { guardDecisionId: decision.decision_id, risk: decision.risk } };
     }
@@ -102,7 +227,7 @@ export default definePluginEntry({
   description: "Local deterministic policy enforcement, approval, and audit hooks",
   register(api) {
     const config = configFor({}, { pluginConfig: api.pluginConfig });
-    api.on("before_tool_call", (event: HookEvent, ctx?: Record<string, unknown>) => beforeTool(event, ctx, config), { priority: 10_000, timeoutMs: 500 });
+    api.on("before_tool_call", (event: HookEvent, ctx?: Record<string, unknown>) => beforeTool(event, ctx, config), { priority: 10_000, timeoutMs: 10_000 });
 
     api.on("after_tool_call", (event: HookEvent, ctx?: Record<string, unknown>) => {
       try {
@@ -124,6 +249,43 @@ export default definePluginEntry({
       }
     });
 
+    api.on("tool_result_persist", (event: HookEvent, ctx?: Record<string, unknown>) => {
+      if ((config.sanitizationMode ?? "observe") === "disabled") return undefined;
+      try {
+        const clean = sanitizeToolMessage(event.message, String(event.toolName ?? ctx?.toolName ?? "unknown"));
+        clientFor(config).observe("/v1/events/sanitization", {
+          schema_version: "1.0", request_id: randomUUID(), sanitizer_event_id: randomUUID(),
+          direction: "inbound", session_key: hashLocal(ctx?.sessionKey) ?? "local:unknown",
+          tool_name: String(event.toolName ?? ctx?.toolName ?? "unknown"),
+          tool_call_id: String(event.toolCallId ?? ctx?.toolCallId ?? "") || undefined,
+          classifications: clean.classifications, transformations: clean.transformations,
+          original_size: clean.original_size, result_size: clean.result_size,
+          truncated: clean.truncated, blocked: false,
+          pattern_digest: SANITIZATION_PATTERN_DIGEST,
+          content_digest: contentDigest(clean.value),
+        });
+        if ((config.sanitizationMode ?? "observe") === "enforce") return { message: clean.value as never };
+        return undefined;
+      } catch {
+        return {
+          message: {
+            role: "tool", toolCallId: event.toolCallId,
+            content: [{ type: "text", text: "<GUARD_SANITIZATION_FAILED original_content_removed=\"true\">" }],
+          } as never,
+        };
+      }
+    }, { priority: 10_000 });
+
+    api.on("before_message_write", (event: HookEvent, ctx?: Record<string, unknown>) => {
+      if ((config.sanitizationMode ?? "observe") !== "enforce") return undefined;
+      try {
+        const clean = sanitizeValue(event.message);
+        return { message: clean.value as never };
+      } catch {
+        return { block: true };
+      }
+    }, { priority: 10_000 });
+
     api.on("message_sending", (event: HookEvent, ctx?: Record<string, unknown>) =>
       outboundDecision(event, ctx, { content: event.content ?? "", ...event }, config),
       { priority: 10_000, timeoutMs: 500 },
@@ -134,10 +296,27 @@ export default definePluginEntry({
     );
 
     api.on("before_agent_run", async (event: HookEvent, ctx?: Record<string, unknown>) => {
+      ctx = withParent(ctx);
+      const inspectionError = startupInspectionErrors.get(configKey(config));
+      if (config.contentInspectionMode === "enforce" && inspectionError) {
+        return {
+          outcome: "block" as const, reason: inspectionError,
+          message: "GuardAgent blocked the run because startup Skill inspection did not complete",
+          category: "content-inspection",
+        };
+      }
+      const client = clientFor(config);
+      if (config.captureTaskPolicy !== false && typeof event.prompt === "string" && event.prompt.trim()) {
+        try {
+          await client.captureTaskPolicy(event, ctx);
+        } catch {
+          // A missing task policy is handled conservatively by guardd at the
+          // first tool boundary when task-policy enforcement is enabled.
+        }
+      }
       if (!config.observeInputInjection) return undefined;
       const text = JSON.stringify(event);
       if (/(ignore|disregard).{0,40}(previous|system).{0,100}(tool|shell|credential|policy)/is.test(text)) {
-        const client = clientFor(config);
         const normalized = unifiedEvent(event, ctx, "agent.before", config, { toolName: "agent_input", params: { prompt: event.prompt ?? "", messages: event.messages ?? [] } });
         try {
           const decision = await client.decide(normalized);
@@ -160,6 +339,39 @@ export default definePluginEntry({
 
     api.on("before_install", async (event: HookEvent, ctx?: Record<string, unknown>) => {
       const client = clientFor(config);
+      if (String(event.targetType ?? "").toLowerCase() === "skill" && typeof event.sourcePath === "string") {
+        try {
+          const inspected = await client.request<Record<string, unknown>>("/v1/inspections/skill", {
+            schema_version: "1.0", request_id: randomUUID(), source_path: event.sourcePath,
+            canonical_name: String(event.targetName ?? "unknown-skill"),
+            source_identity: String(event.source ?? event.request ?? "openclaw-install").slice(0, 512),
+            expected_content_digest: typeof event.contentDigest === "string" ? event.contentDigest : undefined,
+            builtin_findings: Array.isArray(event.findings) ? event.findings :
+              event.builtinScan && typeof event.builtinScan === "object" && Array.isArray((event.builtinScan as Record<string, unknown>).findings) ? (event.builtinScan as Record<string, unknown>).findings :
+              Array.isArray(event.builtinFindings) ? event.builtinFindings : [],
+          });
+          const verdict = inspected.verdict as Record<string, unknown> | undefined;
+          const contentDigest = String(inspected.content_digest ?? "");
+          const contentDecision = String(inspected.effective_decision ?? verdict?.decision ?? "QUARANTINE");
+          if (config.contentInspectionMode === "enforce" && ["DENY", "QUARANTINE", "STALE"].includes(contentDecision)) {
+            return { block: true, blockReason: `GuardAgent ${contentDecision.toLowerCase()} verdict for skill digest ${contentDigest.slice(0, 20)}` };
+          }
+          if (config.contentInspectionMode === "enforce" && contentDecision === "REQUIRE_APPROVAL") {
+            return {
+              block: true,
+              blockReason: `GuardAgent requires digest-bound skill confirmation for ${contentDigest}. Review it in the local UI or run guardctl inspections approve ${contentDigest}, then retry installation.`,
+            };
+          }
+        } catch {
+          if (config.contentInspectionMode === "enforce") {
+            return { block: true, blockReason: "GuardAgent skill inspection failed closed" };
+          }
+          // Inspection is an optional observer here; allow the mandatory base
+          // install-policy decision to make one immediate request rather than
+          // inheriting this endpoint's transient circuit-breaker delay.
+          client.retryNow();
+        }
+      }
       const normalized = unifiedEvent(event, ctx, "install.before", config, { toolName: "install", params: event });
       try {
         const decision = await client.decide(normalized);
@@ -168,18 +380,36 @@ export default definePluginEntry({
       } catch {
         return { block: true, blockReason: "GuardAgent unavailable: install failed closed; security.installPolicy remains authoritative" };
       }
-    }, { priority: 10_000, timeoutMs: 500 });
+    }, { priority: 10_000, timeoutMs: 10_000 });
 
-    for (const name of ["session_start", "session_end", "agent_end", "subagent_spawned", "subagent_ended"] as const) {
+    for (const name of ["session_start", "session_end", "agent_end"] as const) {
       api.on(name, (event: HookEvent, ctx?: Record<string, unknown>) => lifecycle(event, ctx, name.replace("_", "."), config));
     }
-    api.on("gateway_start", (event: HookEvent, ctx?: Record<string, unknown>) => {
-      lifecycle(event, ctx, "gateway.start", config);
+    api.on("subagent_spawned", (event: HookEvent, ctx?: Record<string, unknown>) => {
+      const child = String(event.childSessionKey ?? ctx?.childSessionKey ?? "");
+      const parent = String(ctx?.requesterSessionKey ?? ctx?.sessionKey ?? "");
+      if (child && parent) parentSessions.set(child, parent);
+      lifecycle(event, ctx, "subagent.spawned", config);
+    });
+    api.on("subagent_ended", (event: HookEvent, ctx?: Record<string, unknown>) => {
+      const child = String(event.targetSessionKey ?? ctx?.childSessionKey ?? "");
+      if (child) parentSessions.delete(child);
+      lifecycle(event, ctx, "subagent.ended", config);
+    });
+    api.on("gateway_start", async (event: HookEvent, ctx?: Record<string, unknown>) => {
+      const client = clientFor(config);
       try {
-        clientFor(config).observe("/v1/health", undefined, "GET");
+        await client.negotiateCapabilities(SANITIZATION_PATTERN_DIGEST);
+        await scanConfiguredSkillRoots(client, config);
+        startupInspectionErrors.delete(configKey(config));
       } catch {
-        // The first guarded action applies the embedded fail-closed policy.
+        // In enforce mode the client retains the incompatibility and guarded
+        // actions fall back to the embedded fail-closed policy.
+        if (config.contentInspectionMode === "enforce") {
+          startupInspectionErrors.set(configKey(config), "GuardAgent capability or Skill inspection failed during Gateway startup");
+        }
       }
+      lifecycle(event, ctx, "gateway.start", config);
     });
     api.on("gateway_stop", (event: HookEvent, ctx?: Record<string, unknown>) => lifecycle(event, ctx, "gateway.stop", config));
   },

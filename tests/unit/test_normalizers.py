@@ -9,7 +9,10 @@ from pathlib import Path
 from guardd.normalizers.command import normalize_command
 from guardd.normalizers.network import normalize_network_targets
 from guardd.normalizers.path import normalize_paths
-from guardd.security import build_extra_patterns, digest_payload, redact_text, sanitize
+from guardd.security import SANITIZATION_PATTERN_DIGEST, build_extra_patterns, digest_payload, redact_text, sanitize
+
+
+ROOT = Path(__file__).parents[2]
 
 
 class CommandNormalizerTests(unittest.TestCase):
@@ -104,12 +107,19 @@ class NetworkAndSecretTests(unittest.TestCase):
         redacted, kinds = redact_text(f"token={secret}")
         self.assertNotIn(secret, redacted)
         self.assertIn("github_token", kinds)
-        self.assertIn("sha256=", redacted)
+        self.assertIn("GUARD_REDACTED", redacted)
+        self.assertNotIn("sha256=", redacted)
 
     def test_sensitive_key_is_redacted(self) -> None:
         clean, kinds = sanitize({"Authorization": "Bearer raw-value"})
         self.assertNotIn("raw-value", str(clean))
         self.assertEqual(kinds, ["sensitive_field"])
+
+    def test_generated_plugin_patterns_match_python_pattern_digest(self) -> None:
+        generated = (ROOT / "plugins" / "guard-openclaw" / "src" / "generated-sanitization-patterns.ts").read_text(encoding="utf-8")
+        self.assertIn(SANITIZATION_PATTERN_DIGEST, generated)
+        _, kinds = redact_text("sk-ant-" + "a" * 30)
+        self.assertEqual(kinds, ["anthropic_key"])
 
     def test_configurable_phone_and_custom_patterns(self) -> None:
         patterns = build_extra_patterns({"detect_phone": True, "custom_patterns": [{"id": "employee_id", "regex": "EMP-[0-9]{4}"}]})

@@ -52,6 +52,11 @@ class ReplayRequest(OperatorRequest):
     policy: str | None = None
 
 
+class TaskPolicyDecisionRequest(OperatorRequest):
+    candidate_digest: str
+    expected_active_revision: int | None = None
+
+
 class UiError(BaseModel):
     code: str
     message: str

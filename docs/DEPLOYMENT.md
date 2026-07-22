@@ -12,6 +12,10 @@ GuardAgent is an additional execution-point control. It does not replace OpenCla
 
 The default GuardAgent mode is `observe`: guardd records both the effective `OBSERVE` result and the proposed decision without blocking. OpenClaw native policy and the plugin's hard-coded degraded-mode emergency controls remain authoritative. Switch to Approval/Enforce only after the rollout gates below are met.
 
+The session task policy, data-path sanitizer, and Skill/MCP content inspection also default to Observe. Their service-side modes are configured with `GUARD_TASK_POLICY_MODE`, `GUARD_SANITIZATION_MODE`, and `GUARD_CONTENT_INSPECTION_MODE`; keep the plugin's `sanitizationMode` and `contentInspectionMode` aligned with the service.
+
+Set the plugin `skillRoots` array to every canonical directory from which the Gateway can load Skills. GuardAgent scans direct child Skills at startup and gates installation; OpenClaw does not currently provide an authoritative Skill-use identity on every run, so incomplete root configuration is an Enforce blocker.
+
 ## 2. Install and initialize
 
 ```powershell
@@ -26,6 +30,14 @@ In a second terminal:
 guardctl status
 guardctl policy validate
 guardctl doctor
+```
+
+Review the new control planes before changing modes:
+
+```powershell
+guardctl task-policy show --session <hashed-session>
+guardctl sanitization events
+guardctl inspections list
 ```
 
 `init_guard.py` creates a random bearer token. Do not copy the token into OpenClaw config or logs; configure only its file path. On Windows, restrict the state directory and token using the current user's ACL. On POSIX, the initializer applies mode `0700` to the state directory and `0600` to the token where supported.
@@ -69,6 +81,20 @@ Do not enter Enforce mode if any of these show sandbox disabled, host/root/home 
 4. Move to `enforce` only when the high-risk fixture set has zero false allows and normal work has acceptable false positives.
 
 Policy changes are schema-validated before loading. An invalid update does not replace the currently loaded policy. Back up OpenClaw config, GuardAgent policy, and the SQLite state before each transition.
+
+### MCP servers
+
+OpenClaw does not currently provide GuardAgent with an authoritative descriptor-registration hook. Route every protected stdio MCP server through the local compatibility proxy so descriptor filtering happens before the descriptor reaches the model:
+
+```powershell
+guard-mcp-proxy --server-identity <stable-server-id> `
+  --guardd-url http://127.0.0.1:8787 `
+  --token-file <absolute-guardd-token-path> `
+  --session-key <stable-hashed-session> --mode observe -- `
+  <mcp-server-command> <arguments...>
+```
+
+The proxy fails closed when guardd is unavailable, binds admitted tool calls to the inspected server/version/descriptor digest, invalidates admissions on `list_changed`, and sanitizes tool results. The repository implementation currently covers stdio only. SSE and Streamable HTTP MCP servers are not protected and must remain disabled or separately isolated.
 
 Create a transactionally consistent database backup from an operator terminal with `python scripts/backup_guard.py <destination.sqlite3>`; the command reports the backup SHA-256 and integrity result.
 

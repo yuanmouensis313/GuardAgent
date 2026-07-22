@@ -25,10 +25,22 @@ from guardd.api.ui.auth import UiAuthManager
 from guardd.approvals.manager import ApprovalError
 from guardd.config import Settings
 from guardd.diagnostics import DiagnosticJobManager
+from guardd.inspections import (
+    InspectionConfirmationRequest, InspectionError, McpDescriptorInspectionRequest, SkillInspectionRequest,
+)
 from guardd.models.events import DecisionRequest, GuardEvent, SessionEvent, ToolResultEvent
 from guardd.realtime import EventBus
 from guardd.security import ensure_token
+from guardd.sanitization import SanitizationEventRequest
 from guardd.service import GuardService
+from guardd.task_policy import (
+    TaskPolicyActivateRequest,
+    TaskPolicyCaptureRequest,
+    TaskPolicyCloseRequest,
+    TaskPolicyContentRevisionRequest,
+    TaskPolicyError,
+    TaskPolicyRejectRequest,
+)
 
 
 class PolicyText(BaseModel):
@@ -206,6 +218,10 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
     def get_status() -> dict[str, Any]:
         return service.status()
 
+    @app.get("/v1/capabilities", dependencies=[Depends(authenticate)])
+    def get_capabilities() -> Any:
+        return service.capabilities()
+
     @app.post("/v1/decisions/tool", dependencies=[Depends(authenticate)])
     def tool_decision(request: DecisionRequest) -> Any:
         request.event.derived["request_id"] = request.request_id
@@ -220,6 +236,66 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
     def tool_result(result: ToolResultEvent) -> dict[str, bool]:
         service.tool_result(result)
         return {"accepted": True}
+
+    @app.post("/v1/events/sanitization", status_code=202, dependencies=[Depends(authenticate)])
+    def sanitization_event(event: SanitizationEventRequest) -> Any:
+        return service.sanitization_event(event)
+
+    @app.get("/v1/sanitization/events", dependencies=[Depends(authenticate)])
+    def sanitization_events(session_key: str | None = None, limit: int = 100) -> Any:
+        return service.store.list_sanitization_events(session_key, min(max(limit, 1), 500))
+
+    @app.get("/v1/sanitization/metrics", dependencies=[Depends(authenticate)])
+    def sanitization_metrics() -> Any:
+        return service.store.sanitization_metrics()
+
+    @app.post("/v1/inspections/skill", dependencies=[Depends(authenticate)])
+    def inspect_skill(body: SkillInspectionRequest) -> Any:
+        try:
+            return service.inspect_skill(body)
+        except InspectionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/inspections/mcp-descriptors", dependencies=[Depends(authenticate)])
+    def inspect_mcp_descriptors(body: McpDescriptorInspectionRequest) -> Any:
+        try:
+            return service.inspect_mcp(body)
+        except InspectionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/inspections/mcp-server", dependencies=[Depends(authenticate)])
+    def inspect_mcp_server(body: McpDescriptorInspectionRequest) -> Any:
+        try:
+            return service.inspect_mcp(body)
+        except InspectionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/v1/inspections", dependencies=[Depends(authenticate)])
+    def list_inspections(kind: str | None = None, limit: int = 100) -> Any:
+        return service.store.list_inspections(kind, min(max(limit, 1), 500))
+
+    @app.get("/v1/inspections/{content_digest}", dependencies=[Depends(authenticate)])
+    def get_inspection(content_digest: str) -> Any:
+        try:
+            return service.inspections.get(content_digest)
+        except InspectionError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/v1/inspections/{content_digest}/confirm", dependencies=[Depends(authenticate)])
+    def confirm_inspection(content_digest: str, body: InspectionConfirmationRequest) -> Any:
+        try:
+            return service.confirm_inspection(content_digest, body)
+        except InspectionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/inspections/{content_digest}/invalidate", dependencies=[Depends(authenticate)])
+    def invalidate_inspection(content_digest: str, body: ApprovalResolution) -> Any:
+        try:
+            result = service.inspections.invalidate(content_digest)
+            service.store.record_operator_action("inspection.invalidate", body.operator, "content_artifact", content_digest)
+            return result
+        except InspectionError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/v1/events/session", status_code=202, dependencies=[Depends(authenticate)])
     def session_event(request: SessionEvent) -> dict[str, bool]:
@@ -267,6 +343,56 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
     @app.post("/v1/policy/reload", dependencies=[Depends(authenticate)])
     def reload_policy(body: ApprovalResolution) -> Any:
         return service.reload_policy(body.operator)
+
+    @app.post("/v1/task-policies/capture", dependencies=[Depends(authenticate)])
+    def capture_task_policy(body: TaskPolicyCaptureRequest) -> Any:
+        try:
+            return service.capture_task_policy(
+                body.prompt, body.session_key, body.agent_id, body.parent_session_key,
+                body.origin,
+            )
+        except TaskPolicyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/v1/task-policies/{session_key}", dependencies=[Depends(authenticate)])
+    def get_task_policy(session_key: str, policy_status: str | None = None) -> Any:
+        try:
+            return service.get_task_policy(session_key, policy_status)
+        except (TaskPolicyError, ValueError) as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/v1/task-policies/{session_key}/activate", dependencies=[Depends(authenticate)])
+    def activate_task_policy(session_key: str, body: TaskPolicyActivateRequest) -> Any:
+        try:
+            return service.activate_task_policy(
+                session_key, body.candidate_digest, body.expected_active_revision, body.operator,
+            )
+        except TaskPolicyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/task-policies/{session_key}/reject", dependencies=[Depends(authenticate)])
+    def reject_task_policy(session_key: str, body: TaskPolicyRejectRequest) -> Any:
+        try:
+            return service.reject_task_policy(session_key, body.candidate_digest, body.operator)
+        except TaskPolicyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/task-policies/{session_key}/revise-content", dependencies=[Depends(authenticate)])
+    def revise_task_policy_content(session_key: str, body: TaskPolicyContentRevisionRequest) -> Any:
+        try:
+            return service.revise_task_policy_content(
+                session_key, body.kind, body.name, body.content_digest,
+                body.expected_active_revision, body.operator, body.artifact_digest,
+            )
+        except (TaskPolicyError, InspectionError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/task-policies/{session_key}/close", dependencies=[Depends(authenticate)])
+    def close_task_policy(session_key: str, body: TaskPolicyCloseRequest) -> Any:
+        try:
+            return service.close_task_policy(session_key, body.operator)
+        except TaskPolicyError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     if settings.ui_enabled:
         app.include_router(create_ui_router(settings, service, token, ui_auth, event_bus, diagnostics))

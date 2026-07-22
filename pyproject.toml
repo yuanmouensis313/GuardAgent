@@ -24,6 +24,7 @@ test = ["pytest>=8.3,<9", "pytest-cov>=6,<7"]
 [project.scripts]
 guardd = "guardd.main:main"
 guardctl = "guardd.cli:app"
+guard-mcp-proxy = "guardd.mcp_proxy:main"
 
 [tool.setuptools.packages.find]
 include = ["guardd*"]
@@ -31,6 +32,7 @@ include = ["guardd*"]
 [tool.setuptools.package-data]
 guardd = ["ui/static/**/*"]
 "guardd.policy" = ["policy.schema.json"]
+"guardd.sanitization" = ["patterns.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

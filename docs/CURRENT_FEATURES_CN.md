@@ -1,6 +1,6 @@
 # GuardAgent 当前已实现功能说明
 
-> 文档日期：2026-07-15
+> 文档日期：2026-07-22
 > 当前版本：0.1.0（MVP）
 > 对应需求：`docs/OPENCLAW_GUARD_AGENT_REQUIREMENTS.md`
 
@@ -545,6 +545,16 @@ break-glass 只停用 GuardAgent，不会自动把 OpenClaw 改成 YOLO、full a
 
 规则清单应以 `policies/default.yaml` 为准；部署方可以在 JSON Schema 约束下调整允许域名、路径、预算和规则。
 
+### 21.1 会话范围、数据通路与内容核查增强
+
+仓库已按 `R_TASK_SANITIZATION_SKILL_MCP_IMPLEMENTATION_PLAN.md` 增加三组控制：
+
+- 会话级 `R_task`：只从当前可信用户目标生成候选规则，绑定 session、agent、sender、基础策略摘要和修订号；首次启用、扩权以及 Skill/MCP 内容授权都要求摘要确认，缩权可自动生效，子会话权限取父子交集；
+- 数据通路脱敏：插件在原始数据离开本地前形成 policy/execution/audit view，决策返回可验证的 transformation plan；工具结果通过同步 `tool_result_persist` 在持久化和下一轮模型读取前脱敏，并带不可信来源标签；
+- Skill/MCP 内容核查：安装前、启动时和可识别的运行时 Skill 以内容摘要扫描；MCP tool/prompt/resource descriptor 在 stdio 代理中逐项检查，未放行项在到达模型前移除，真实调用继续绑定 descriptor 和 server 摘要。
+
+三组能力都有独立的 Observe/Enforce 配置、SQLite 审计、机器 API、CLI 和本地 UI 页面。当前 MCP 兼容代理仅覆盖 stdio；SSE 和 Streamable HTTP 会由 capability API 明确报告为未保护。
+
 ## 22. 测试与验证证据
 
 当前仓库包含：
@@ -559,17 +569,14 @@ break-glass 只停用 GuardAgent，不会自动把 OpenClaw 改成 YOLO、full a
 - 插件 runtime 构建验证；
 - Web 控制台 TypeScript、组件测试和生产构建验证。
 
-最近一次完整验证记录为：
+当前验证范围还包括 R_task 状态机和子会话继承、Python/TypeScript pattern 一致性、双向 sanitizer、Skill/MCP 摘要失效、六类间接提示注入场景，以及使用真实子进程的 stdio MCP 代理端到端测试。具体通过/跳过数量以当次 CI 输出为准，避免在说明文档中保留过期计数。
 
-- Python：69 个通过，1 个跳过；
-- 跳过项：当前 Windows 进程没有真实 symlink/junction 创建权限；
-- TypeScript 插件：9 个测试通过；
-- TypeScript strict checking 通过；
-- 插件 runtime build 通过；
-- Web 控制台：9 个测试、TypeScript strict checking 和 Vite production build 通过；
-- 10,000 次本地确定性决策 P50 约 0.713 ms；
-- 10,000 次本地确定性决策 P95 约 0.892 ms；
-- 100 并发决策 P95 约 12.439 ms；
+最近一次性能基线记录为：
+
+- TypeScript strict checking、插件 runtime build 和 Web production build 纳入最终验收命令；
+- 10,000 次本地确定性决策 P50 约 0.948 ms；
+- 10,000 次本地确定性决策 P95 约 1.375 ms；
+- 100 并发决策 P95 约 14.994 ms；
 - 实际 loopback smoke test 中 SQLite integrity 为 `ok`。
 
 Python 测试覆盖：
@@ -633,11 +640,13 @@ UI 静态资源缺失、SSE 断线或诊断任务失败不会影响插件判定�
 - 插件异步队列饱和的专门压力测试仍需补充；
 - 外部进程长期占用 SQLite 写锁后的恢复测试仍需补充；
 - 终端 `guardctl allow-once` 与正在等待的 OpenClaw 原生调用之间需要真实 Gateway 联调并明确恢复语义。
+- MCP SSE 和 Streamable HTTP 传输尚无 descriptor 前置代理，当前只允许把 stdio 声明为受保护传输；
 
 ### 23.2 需要真实 OpenClaw 环境验证
 
 - 当前主机没有已配置并运行的全局 OpenClaw Gateway；
 - 插件已通过 SDK 编译和模拟测试，但尚未在用户真实 Gateway 中执行完整 Hook 链；
+- `tool_result_persist` 返回的消息必须在真实 Gateway 中证明是下一轮模型实际读取的内容，完成前入站通路不得在生产启用 Enforce；
 - sandbox、tool policy、exec approvals 和 channel pairing 尚未在目标主机验收；
 - OpenClaw 升级后的兼容性回归尚未在生产实例执行；
 - Gateway 重启、插件禁用和配置变化告警需要真实实例验证；
@@ -681,6 +690,10 @@ UI 静态资源缺失、SSE 断线或诊断任务失败不会影响插件判定�
 | `web/` | React/TypeScript 可视化界面源码 |
 | `guardd/policy/engine.py` | 策略匹配和决策 |
 | `guardd/correlation.py` | 跨调用关联和预算 |
+| `guardd/task_policy/` | 会话级 R_task 生成、确认、修订和继承 |
+| `guardd/sanitization/` | 版本化脱敏模式与审计模型 |
+| `guardd/inspections/` | Skill/MCP 内容扫描、摘要缓存和确认 |
+| `guardd/mcp_proxy.py` | stdio MCP descriptor 前置核查与结果脱敏 |
 | `guardd/audit/store.py` | SQLite 审计 |
 | `guardd/approvals/manager.py` | 一次性审批 |
 | `guardd/normalizers/` | 命令、路径和网络归一化 |

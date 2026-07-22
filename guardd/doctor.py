@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from guardd.config import Settings
+from guardd.security import SANITIZATION_PATTERN_DIGEST
 
 
 @dataclass
@@ -53,6 +54,31 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
     checks.append(Check("loopback-bind", "pass" if settings.host in {"127.0.0.1", "::1", "localhost"} else "fail", settings.host))
     checks.append(Check("policy-file", "pass" if settings.policy_path.is_file() else "fail", str(settings.policy_path)))
     checks.append(Check("token-file", "pass" if settings.token_path.is_file() else "warn", str(settings.token_path)))
+    root = Path(__file__).parents[1]
+    generated_patterns = root / "plugins" / "guard-openclaw" / "src" / "generated-sanitization-patterns.ts"
+    pattern_source_available = generated_patterns.is_file()
+    pattern_match = pattern_source_available and SANITIZATION_PATTERN_DIGEST in generated_patterns.read_text(encoding="utf-8")
+    checks.append(Check(
+        "sanitization-pattern-parity",
+        "pass" if pattern_match else "fail" if pattern_source_available else "warn",
+        SANITIZATION_PATTERN_DIGEST if pattern_source_available else "repository TypeScript source is unavailable in this installed package; verify parity in CI",
+    ))
+    plugin_index = root / "plugins" / "guard-openclaw" / "src" / "index.ts"
+    plugin_source_available = plugin_index.is_file()
+    hook_source = plugin_index.read_text(encoding="utf-8") if plugin_source_available else ""
+    hooks_present = "tool_result_persist" in hook_source and "before_message_write" in hook_source
+    checks.append(Check(
+        "model-path-sanitization-hooks",
+        "pass" if hooks_present else "fail" if plugin_source_available else "warn",
+        "tool_result_persist + before_message_write" if hooks_present else
+        "required synchronous hooks are missing" if plugin_source_available else
+        "repository plugin source is unavailable in this installed package; validate the installed plugin separately",
+    ))
+    proxy_available = (root / "guardd" / "mcp_proxy.py").is_file()
+    checks.append(Check(
+        "mcp-descriptor-gate", "pass" if proxy_available else "fail",
+        "guard-mcp-proxy available; current OpenClaw SDK has no descriptor registration hook" if proxy_available else "MCP proxy is missing",
+    ))
     if settings.db_path.exists():
         checks.append(Check("state-outside-workspace", "fail" if _inside(settings.db_path, settings.workspace) else "pass", str(settings.db_path)))
     overall = "pass" if all(item.status == "pass" for item in checks) else "fail" if any(item.status == "fail" for item in checks) else "warn"

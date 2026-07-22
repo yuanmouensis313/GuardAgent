@@ -14,16 +14,23 @@ from guardd.config import Settings
 from guardd.doctor import run_doctor
 from guardd.models.events import GuardEvent
 from guardd.policy import PolicyEngine, PolicyLoader, PolicyValidationError
-from guardd.security import ensure_token
+from guardd.security import ensure_token, sanitize
+from guardd.task_policy import TaskPolicy
 
 
 app = typer.Typer(help="GuardAgent management CLI", no_args_is_help=True)
 events_app = typer.Typer(help="Audit events")
 approvals_app = typer.Typer(help="Single-use approvals")
 policy_app = typer.Typer(help="Policy validation and simulation")
+task_policy_app = typer.Typer(help="Session task policy inspection and confirmation")
+sanitization_app = typer.Typer(help="Data-path sanitization inspection and tests")
+inspections_app = typer.Typer(help="Skill and MCP content inspection management")
 app.add_typer(events_app, name="events")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(policy_app, name="policy")
+app.add_typer(task_policy_app, name="task-policy")
+app.add_typer(sanitization_app, name="sanitization")
+app.add_typer(inspections_app, name="inspections")
 
 
 def _settings() -> Settings:
@@ -38,6 +45,17 @@ def _client() -> httpx.Client:
 
 def _print(value: Any) -> None:
     typer.echo(json.dumps(value, ensure_ascii=False, indent=2, default=str))
+
+
+def _task_policy_get(client: httpx.Client, session: str, status: str | None = None) -> dict[str, Any] | None:
+    response = client.get(
+        f"/v1/task-policies/{quote(session, safe='')}",
+        params={"policy_status": status} if status else None,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json()
 
 
 @app.command("status")
@@ -146,6 +164,216 @@ def test_fixture(path: Path) -> None:
     _print({"passed": not failures, "failures": failures, "actual": decision.model_dump(mode="json")})
     if failures:
         raise typer.Exit(1)
+
+
+@task_policy_app.command("show")
+def show_task_policy(session: str = typer.Option(..., "--session")) -> None:
+    with _client() as client:
+        policy = _task_policy_get(client, session)
+    if policy is None:
+        _print({"session_key": session, "task_policy": None})
+        raise typer.Exit(1)
+    _print(policy)
+
+
+@task_policy_app.command("candidate")
+def show_task_policy_candidate(session: str = typer.Option(..., "--session")) -> None:
+    with _client() as client:
+        policy = _task_policy_get(client, session, "candidate")
+    if policy is None:
+        _print({"session_key": session, "candidate": None})
+        raise typer.Exit(1)
+    _print(policy)
+
+
+@task_policy_app.command("approve")
+def approve_task_policy(
+    session: str = typer.Option(..., "--session"),
+    digest: str = typer.Option(..., "--digest"),
+) -> None:
+    with _client() as client:
+        active = _task_policy_get(client, session, "active")
+        response = client.post(
+            f"/v1/task-policies/{quote(session, safe='')}/activate",
+            json={
+                "schema_version": "1.0", "request_id": f"guardctl-task-{uuid4()}",
+                "candidate_digest": digest,
+                "expected_active_revision": active.get("revision") if active else None,
+                "operator": "local-terminal",
+            },
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@task_policy_app.command("reject")
+def reject_task_policy(
+    session: str = typer.Option(..., "--session"),
+    digest: str = typer.Option(..., "--digest"),
+) -> None:
+    with _client() as client:
+        response = client.post(
+            f"/v1/task-policies/{quote(session, safe='')}/reject",
+            json={
+                "schema_version": "1.0", "request_id": f"guardctl-task-{uuid4()}",
+                "candidate_digest": digest, "operator": "local-terminal",
+            },
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@task_policy_app.command("simulate")
+def simulate_task_policy(path: Path) -> None:
+    """Validate and summarize a task-policy JSON document without activating it."""
+    try:
+        policy = TaskPolicy.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        _print({"valid": False, "errors": [str(exc)]})
+        raise typer.Exit(1)
+    _print({
+        "valid": True, "session_key": policy.session_key, "revision": policy.revision,
+        "status": policy.status.value, "digest": policy.policy_digest,
+        "summary": policy.objective.summary,
+        "permissions": {
+            "tools": policy.tools.allow, "read_paths": policy.files.read,
+            "write_paths": policy.files.write, "network_read": policy.network.read,
+            "network_write": policy.network.write,
+        },
+    })
+
+
+@task_policy_app.command("allow-content")
+def allow_task_content(
+    session: str = typer.Option(..., "--session"),
+    kind: str = typer.Option(..., "--kind"),
+    name: str = typer.Option(..., "--name"),
+    digest: str = typer.Option(..., "--digest"),
+    artifact_digest: str | None = typer.Option(None, "--artifact-digest"),
+) -> None:
+    if kind not in {"skill", "mcp"}:
+        raise typer.BadParameter("kind must be skill or mcp")
+    with _client() as client:
+        active = _task_policy_get(client, session, "active")
+        if active is None:
+            _print({"error": "no active task policy", "session_key": session})
+            raise typer.Exit(1)
+        response = client.post(
+            f"/v1/task-policies/{quote(session, safe='')}/revise-content",
+            json={
+                "schema_version": "1.0", "request_id": f"guardctl-task-{uuid4()}",
+                "kind": kind, "name": name, "content_digest": digest,
+                "artifact_digest": artifact_digest, "expected_active_revision": active["revision"],
+                "operator": "local-terminal",
+            },
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@sanitization_app.command("events")
+def sanitization_events(
+    session: str | None = typer.Option(None, "--session"),
+    limit: int = typer.Option(100, "--limit", min=1, max=500),
+) -> None:
+    with _client() as client:
+        response = client.get(
+            "/v1/sanitization/events",
+            params={"session_key": session, "limit": limit},
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@sanitization_app.command("test")
+def test_sanitization_fixture(path: Path) -> None:
+    """Run the Python audit sanitizer against a local JSON fixture."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _print({"valid": False, "errors": [str(exc)]})
+        raise typer.Exit(1)
+    clean, classifications = sanitize(payload)
+    _print({"valid": True, "classifications": classifications, "sanitized": clean})
+
+
+@inspections_app.command("list")
+def list_inspections(
+    kind: str | None = typer.Option(None, "--kind"),
+    limit: int = typer.Option(100, "--limit", min=1, max=500),
+) -> None:
+    if kind not in {None, "skill", "mcp"}:
+        raise typer.BadParameter("kind must be skill or mcp")
+    with _client() as client:
+        response = client.get("/v1/inspections", params={"kind": kind, "limit": limit})
+        response.raise_for_status()
+        _print(response.json())
+
+
+@inspections_app.command("show")
+def show_inspection(content_digest: str) -> None:
+    with _client() as client:
+        response = client.get(f"/v1/inspections/{quote(content_digest, safe='')}")
+        response.raise_for_status()
+        _print(response.json())
+
+
+def _confirm_inspection(content_digest: str, decision: str, scope: str, session: str | None) -> None:
+    with _client() as client:
+        response = client.post(
+            f"/v1/inspections/{quote(content_digest, safe='')}/confirm",
+            json={
+                "schema_version": "1.0", "request_id": f"guardctl-inspection-{uuid4()}",
+                "operator": "local-terminal", "decision": decision, "scope": scope,
+                "session_key": session,
+            },
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@inspections_app.command("approve")
+def approve_inspection(
+    content_digest: str,
+    scope: str = typer.Option("allow-this-digest", "--scope"),
+    session: str | None = typer.Option(None, "--session"),
+) -> None:
+    _confirm_inspection(content_digest, "approve", scope, session)
+
+
+@inspections_app.command("deny")
+def deny_inspection(content_digest: str) -> None:
+    _confirm_inspection(content_digest, "deny", "allow-this-digest", None)
+
+
+@inspections_app.command("invalidate")
+def invalidate_inspection(content_digest: str) -> None:
+    with _client() as client:
+        response = client.post(
+            f"/v1/inspections/{quote(content_digest, safe='')}/invalidate",
+            json={"schema_version": "1.0", "request_id": f"guardctl-inspection-{uuid4()}", "operator": "local-terminal"},
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@inspections_app.command("rescan")
+def rescan_skill(
+    source: Path,
+    name: str = typer.Option(..., "--name"),
+    source_identity: str = typer.Option("local-cli", "--source-identity"),
+) -> None:
+    with _client() as client:
+        response = client.post(
+            "/v1/inspections/skill",
+            json={
+                "schema_version": "1.0", "request_id": f"guardctl-inspection-{uuid4()}",
+                "source_path": str(source.resolve()), "canonical_name": name,
+                "source_identity": source_identity, "builtin_findings": [],
+            },
+        )
+        response.raise_for_status()
+        _print(response.json())
 
 
 @app.command("replay")

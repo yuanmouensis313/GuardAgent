@@ -24,6 +24,7 @@ class UiApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
+        self.root = root
         self.workspace = root / "workspace"
         self.workspace.mkdir()
         policy = copy.deepcopy(PolicyLoader().load(ROOT / "policies/default.yaml").document)
@@ -140,7 +141,12 @@ class UiApiTests(unittest.TestCase):
             json={"schema_version": "1.0", "request_id": "replay"},
         )
         self.assertEqual(replay.status_code, 200)
-        self.assertEqual(replay.json()["item"]["source"], "session")
+        replay_item = replay.json()["item"]
+        self.assertEqual(replay_item["source"], "session")
+        self.assertEqual(replay_item["evidence"], "recorded_sanitized_normalized")
+        self.assertEqual(len(replay_item["results"]), 1)
+        self.assertEqual(replay_item["results"][0]["decision"], "ALLOW")
+        self.assertIn("GIT-READ-001", replay_item["results"][0]["rule_ids"])
 
     def test_event_combination_filters_and_cursor_paging(self) -> None:
         self.client.post("/v1/decisions/tool", headers=self.machine_auth, json=self.event("git status", "filter-a"))
@@ -167,6 +173,73 @@ class UiApiTests(unittest.TestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["item"]["io_summary"]["write_bytes"], 10)
         self.assertGreaterEqual(detail.json()["item"]["risk_score"], 0)
+
+    def test_session_task_policy_can_be_reviewed_and_activated_in_ui(self) -> None:
+        captured = self.client.post(
+            "/v1/task-policies/capture", headers=self.machine_auth,
+            json={
+                "schema_version": "1.0", "request_id": "capture-task", "session_key": "ui-task",
+                "agent_id": "main", "prompt": "保存到 reports/ui.md",
+            },
+        )
+        self.assertEqual(captured.status_code, 200)
+        candidate = captured.json()
+        view = self.client.get("/v1/ui/sessions/ui-task/task-policy")
+        self.assertEqual(view.status_code, 200)
+        self.assertEqual(view.json()["item"]["candidate"]["policy_digest"], candidate["policy_digest"])
+        self.assertTrue(view.json()["item"]["diff"]["tools_allow"]["added"])
+
+        activated = self.client.post(
+            "/v1/ui/sessions/ui-task/task-policy/activate", headers=self.write_headers,
+            json={
+                "schema_version": "1.0", "request_id": "activate-task",
+                "candidate_digest": candidate["policy_digest"], "expected_active_revision": None,
+            },
+        )
+        self.assertEqual(activated.status_code, 200)
+        self.assertEqual(activated.json()["item"]["status"], "active")
+        updated = self.client.get("/v1/ui/sessions/ui-task/task-policy").json()["item"]
+        self.assertIsNone(updated["candidate"])
+        self.assertEqual(updated["active"]["revision"], 1)
+
+    def test_content_inspection_and_sanitization_views_expose_metadata_only(self) -> None:
+        skill = self.root / "review-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("Use subprocess.run with git status.", encoding="utf-8")
+        inspected = self.client.post(
+            "/v1/inspections/skill", headers=self.machine_auth,
+            json={
+                "schema_version": "1.0", "request_id": "inspect-ui", "source_path": str(skill),
+                "canonical_name": "review-skill", "source_identity": "ui-test", "builtin_findings": [],
+            },
+        )
+        self.assertEqual(inspected.status_code, 200)
+        digest = inspected.json()["content_digest"]
+        listed = self.client.get("/v1/ui/inspections").json()["items"]
+        self.assertIn(digest, {item["content_digest"] for item in listed})
+        detail = self.client.get(f"/v1/ui/inspections/{digest}")
+        self.assertEqual(detail.status_code, 200)
+        approved = self.client.post(
+            f"/v1/ui/inspections/{digest}/confirm", headers=self.write_headers,
+            json={
+                "schema_version": "1.0", "request_id": "approve-inspection", "operator": "ignored",
+                "decision": "approve", "scope": "allow-this-digest",
+            },
+        )
+        self.assertEqual(approved.status_code, 200)
+
+        self.client.post(
+            "/v1/events/sanitization", headers=self.machine_auth,
+            json={
+                "schema_version": "1.0", "request_id": "san-ui", "sanitizer_event_id": "san-ui",
+                "direction": "inbound", "session_key": "sha256:ui", "tool_name": "web_fetch",
+                "classifications": ["token"], "transformations": [], "original_size": 20,
+                "result_size": 10, "truncated": False, "blocked": False,
+            },
+        )
+        events = self.client.get("/v1/ui/sanitization/events").json()["items"]
+        self.assertEqual(events[0]["classifications"], ["token"])
+        self.assertNotIn("raw", self.client.get("/v1/ui/sanitization/events").text.lower())
 
     def test_approval_resolution_is_single_winner(self) -> None:
         decision = self.client.post("/v1/decisions/tool", headers=self.machine_auth, json=self.event("git push origin main", "approval-ui")).json()

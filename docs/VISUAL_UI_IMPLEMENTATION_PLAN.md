@@ -16,7 +16,7 @@
 - Python：69 项通过，1 项因 Windows 进程缺少符号链接权限跳过；
 - Web：TypeScript 严格检查通过，Vitest 9 项通过，Vite 生产构建通过；
 - OpenClaw 插件：TypeScript 严格检查通过，9 项测试通过；
-- 最新 Web 构建约 441 KB gzip，七个页面按路由拆分，无 CDN、遥测或远程字体；
+- 最新 Web 构建约 445 KB gzip，九个页面按路由拆分，无 CDN、遥测或远程字体；
 - `guardd/ui/static/` 已于 2026-07-16 由当前 `web/` 源码完成生产构建并纳入交付内容；后续修改 `web/src/` 时仍须执行 `cd web && npm run build`；
 - 真实 Gateway 联调、3–7 天 Observe 运行和目标主机浏览器验收属于部署门槛，不由仓库自动化测试替代。
 

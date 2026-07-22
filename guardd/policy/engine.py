@@ -142,11 +142,31 @@ class PolicyEngine:
         bound_params = rewritten_params if rewritten_params is not None else event.params
         clean_params, classifications = sanitize(bound_params, extra_patterns=self.secret_patterns)
         event.data_classification = sorted(set(event.data_classification + classifications))
+        transformation_plan: list[dict[str, Any]] = []
+        if event.data_classification:
+            actions = set(event.derived.get("actions", []))
+            targets = event.derived.get("network_targets", [])
+            paths = event.derived.get("paths", [])
+            external = bool(actions & {"external_send", "network_write"}) or any(
+                item.get("direction") == "outbound_write" and item.get("classification") != "loopback"
+                for item in targets
+            )
+            local_paths_only = bool(paths) and all(
+                item.get("path_group") == "workspace_readwrite" for item in paths
+            ) and not targets
+            action = "block" if external else "preserve" if local_paths_only else "redact"
+            transformation_plan = [
+                {"classification": kind, "action": action, "scope": "event", "source": "policy_view"}
+                for kind in sorted(set(event.data_classification))
+            ]
+        transformation_digest = digest_payload(transformation_plan) if transformation_plan else None
+        task_context = event.derived.get("task_policy", {})
+        content_context = event.derived.get("content_inspection", {})
         binding = {
             "agent_id": event.agent_id, "session_key": event.session_key,
             "run_id": event.run_id, "sender_id": event.origin.sender_id,
             "tool": event.tool.model_dump() if event.tool else None,
-            "params": bound_params, "cwd": bound_params.get("cwd"),
+            "params": clean_params, "cwd": clean_params.get("cwd"),
             "paths": bound_event.derived.get("paths", []), "network_targets": bound_event.derived.get("network_targets", []),
         }
         return Decision(
@@ -154,8 +174,15 @@ class PolicyEngine:
             would_decide=proposed if effective != proposed else None,
             risk=risk, rule_ids=rule_ids, reason=reason, effective_mode=mode,
             parameter_digest=digest_payload(binding), sanitized_params=clean_params,
+            execution_params=rewritten_params,
             rewritten_params=rewritten_params,
+            transformation_plan=transformation_plan,
+            transformation_digest=transformation_digest,
             remediation="Review the normalized target and approve once" if effective == DecisionKind.REQUIRE_APPROVAL else None,
+            task_policy_digest=task_context.get("digest") if isinstance(task_context, dict) else None,
+            task_policy_revision=task_context.get("revision") if isinstance(task_context, dict) else None,
+            task_policy_verdict=task_context.get("verdict") if isinstance(task_context, dict) else None,
+            content_verdict_digest=digest_payload(content_context) if content_context else None,
         )
 
     def _matches(self, match: dict[str, Any], event: GuardEvent) -> bool:
