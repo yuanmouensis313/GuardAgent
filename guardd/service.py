@@ -15,10 +15,16 @@ from guardd.approvals import ApprovalManager
 from guardd.audit import AuditStore
 from guardd.config import Settings
 from guardd.correlation import CorrelationEngine
+from guardd.inspections import (
+    InspectionConfirmationRequest, InspectionError, InspectionManager, McpDescriptorInspectionRequest,
+    SkillInspectionRequest,
+)
 from guardd.models.decisions import Decision, DecisionKind
 from guardd.models.events import GuardEvent, ToolResultEvent
 from guardd.policy import PolicyEngine, PolicyLoader, PolicyValidationError
-from guardd.security import digest_payload, sanitize
+from guardd.security import SANITIZATION_PATTERN_DIGEST, digest_payload, ensure_hmac_key, sanitize
+from guardd.sanitization import SanitizationEventRequest
+from guardd.task_policy import TaskPolicyError, TaskPolicyManager, TaskPolicyStatus
 
 
 class GuardService:
@@ -28,6 +34,9 @@ class GuardService:
         self.policy = self.loader.load(settings.policy_path)
         self.engine = PolicyEngine(self.policy, settings.workspace)
         self.store = AuditStore(settings.db_path, settings.emergency_log_path, self.engine.secret_patterns)
+        self.inspections = InspectionManager(
+            self.store, ensure_hmac_key(settings.hmac_key_path), self.policy.digest,
+        )
         if settings.audit_retention_days > 0:
             retention = self.store.purge_before(
                 (datetime.now(timezone.utc) - timedelta(days=settings.audit_retention_days)).isoformat()
@@ -36,6 +45,15 @@ class GuardService:
                 self.store.record_operator_action("retention.purge", "startup", "audit", detail=retention)
         self.approvals = ApprovalManager(self.store, settings.approval_ttl_seconds)
         self.correlation = self._create_correlation(self.policy.document)
+        self.task_policies = TaskPolicyManager(
+            self.store,
+            settings.workspace,
+            settings.hmac_key_path,
+            self.policy.digest,
+            mode=settings.task_policy_mode,
+            ttl_minutes=settings.task_policy_ttl_minutes,
+            out_of_scope=settings.task_policy_out_of_scope,
+        ) if settings.task_policy_enabled else None
         self._event_sink: Callable[[str, dict[str, Any]], None] | None = None
         self._events: dict[UUID, GuardEvent] = {}
         self._policy_lock = threading.RLock()
@@ -85,7 +103,9 @@ class GuardService:
             with self._policy_lock:
                 event = self.engine.normalize(event)
                 correlations = self.correlation.evaluate(event)
-                decision = self.engine.decide(event, correlations)
+                task_matches = self.task_policies.evaluate(event) if self.task_policies else []
+                inspection_matches = self._inspection_matches(event)
+                decision = self.engine.decide(event, [*correlations, *inspection_matches, *task_matches])
         except Exception as exc:
             proposed = DecisionKind(str(self.policy.document.get("defaults", {}).get("on_parse_error", "require_approval")).upper())
             effective = DecisionKind.OBSERVE if self.policy.mode == "observe" else proposed
@@ -134,6 +154,40 @@ class GuardService:
         self._emit("approval.resolved", {"approval_id": str(approval_id), "status": result["status"]})
         return result
 
+    def _inspection_matches(self, event: GuardEvent) -> list[dict[str, Any]]:
+        identity = event.content_identity
+        if not self.settings.content_inspection_enabled or self.settings.content_inspection_mode == "disabled":
+            return []
+        if identity is None or identity.kind == "native":
+            return []
+        inspection_digest = identity.artifact_digest or identity.digest
+        if not inspection_digest:
+            return [{
+                "id": "CONTENT-INSPECTION-MISSING-001", "decision": "REQUIRE_APPROVAL", "risk": "high",
+                "reason": "Skill/MCP content has no digest-bound inspection identity", "priority": 1900,
+            }]
+        try:
+            verdict = self.inspections.effective_decision(inspection_digest, event.session_key)
+        except InspectionError:
+            verdict = "STALE"
+        event.derived["content_inspection"] = {
+            "kind": identity.kind, "name": identity.name, "digest": identity.digest,
+            "artifact_digest": inspection_digest, "verdict": verdict,
+        }
+        if self.settings.content_inspection_mode == "observe":
+            return []
+        if verdict == "ALLOW":
+            return []
+        if verdict == "REQUIRE_APPROVAL":
+            decision = "REQUIRE_APPROVAL"
+        else:
+            decision = "DENY"
+        return [{
+            "id": f"CONTENT-INSPECTION-{verdict}-001", "decision": decision,
+            "risk": "critical" if verdict in {"DENY", "QUARANTINE"} else "high",
+            "reason": f"{identity.kind} content inspection verdict is {verdict}", "priority": 1950,
+        }]
+
     def tool_result(self, result: ToolResultEvent) -> None:
         self.store.record_tool_result(result)
         event = self._events.get(result.event_id)
@@ -142,9 +196,54 @@ class GuardService:
             self.correlation.record_result(event, result.success, size)
         self._emit("event.tool_result", {"event_id": str(result.event_id), "success": result.success})
 
+    def sanitization_event(self, event: SanitizationEventRequest) -> dict[str, Any]:
+        self.store.record_sanitization_event(event)
+        self._emit("sanitization.recorded", {
+            "sanitizer_event_id": event.sanitizer_event_id,
+            "session_key": event.session_key,
+            "direction": event.direction,
+            "blocked": event.blocked,
+        })
+        return {"status": "recorded", "sanitizer_event_id": event.sanitizer_event_id}
+
+    def inspect_skill(self, request: SkillInspectionRequest) -> dict[str, Any]:
+        result = self.inspections.inspect_skill(request)
+        self.store.record_operator_action(
+            "inspection.skill", "openclaw", "content_artifact", result["content_digest"],
+            {"name": result["canonical_name"], "decision": result["verdict"]["decision"], "cache_hit": result["cache_hit"]},
+        )
+        self._emit("inspection.updated", {
+            "content_digest": result["content_digest"], "kind": "skill",
+            "decision": result["verdict"]["decision"],
+        })
+        return result
+
+    def inspect_mcp(self, request: McpDescriptorInspectionRequest) -> dict[str, Any]:
+        result = self.inspections.inspect_mcp(request)
+        self.store.record_operator_action(
+            "inspection.mcp", "mcp-proxy", "content_artifact", result["content_digest"],
+            {"name": result["canonical_name"], "decision": result["verdict"]["decision"], "cache_hit": result["cache_hit"]},
+        )
+        self._emit("inspection.updated", {
+            "content_digest": result["content_digest"], "kind": "mcp",
+            "decision": result["verdict"]["decision"],
+        })
+        return result
+
+    def confirm_inspection(self, content_digest: str, request: InspectionConfirmationRequest) -> dict[str, Any]:
+        result = self.inspections.confirm(content_digest, request)
+        self.store.record_operator_action(
+            f"inspection.{request.decision}", request.operator, "content_artifact", content_digest,
+            {"scope": request.scope, "session_key": request.session_key},
+        )
+        self._emit("inspection.updated", {"content_digest": content_digest, "decision": request.decision})
+        return result
+
     def session_event(self, event: GuardEvent) -> None:
         event = self.engine.normalize(event)
         self.correlation.session_event(event)
+        if self.task_policies and event.event_type == "session.end":
+            self.task_policies.close(event.session_key, "session-end")
         self.store.record_event(event)
         status = "ended" if event.event_type.endswith("end") else "active"
         with self.store._lock, self.store._connection:
@@ -237,19 +336,29 @@ class GuardService:
         candidate = self.loader.parse(text, self.settings.policy_path)
         results: list[dict[str, Any]] = []
         if session_key:
-            # A session replay must preserve the deployed workspace and network
-            # semantics because it answers what this host would decide now.
+            # Only replay events that originally produced a decision. Lifecycle
+            # telemetry is useful in the timeline but is not a policy action.
+            # Audit rows intentionally discard raw secrets, so reuse their
+            # sanitized normalized evidence instead of attempting to normalize
+            # summarized parameters a second time.
             engine = PolicyEngine(candidate, self.settings.workspace)
             events = self.store.replay_events(session_key)
             for raw in events:
                 try:
                     event = GuardEvent.model_validate(raw)
-                    decision = engine.decide(engine.normalize(event.model_copy(deep=True, update={"derived": {}})), [])
+                    if "guardd_version" not in event.derived:
+                        results.append({"event_id": str(event.event_id), "error": "normalized audit evidence is unavailable"})
+                        continue
+                    decision = engine.decide(event, [])
                     proposed = decision.would_decide or decision.decision
                     results.append({"event_id": str(event.event_id), "decision": proposed.value, "risk": decision.risk, "rule_ids": decision.rule_ids})
                 except (ValueError, KeyError) as exc:
                     results.append({"error": str(exc)})
-            return {"source": "session", "session_key": session_key, "passed": all("error" not in item for item in results), "results": results}
+            return {
+                "source": "session", "session_key": session_key,
+                "evidence": "recorded_sanitized_normalized",
+                "passed": all("error" not in item for item in results), "results": results,
+            }
 
         fixtures_root = Path(__file__).parents[1] / "fixtures"
         # Built-in fixtures are a deterministic policy regression suite, not a
@@ -312,6 +421,9 @@ class GuardService:
         self.engine = PolicyEngine(candidate, self.settings.workspace)
         self.store.secret_patterns = self.engine.secret_patterns
         self.correlation = self._create_correlation(candidate.document)
+        if self.task_policies:
+            self.task_policies.update_base_policy_digest(candidate.digest)
+        self.inspections.update_policy_digest(candidate.digest)
         self._restore_recent_state()
 
     def publish_policy(
@@ -388,8 +500,149 @@ class GuardService:
             "version": "0.1.0", "mode": self.policy.mode, "policy_digest": self.policy.digest,
             "policy_source": str(self.policy.source), "workspace": str(self.settings.workspace),
             "database": str(self.settings.db_path), "database_integrity": self.store.integrity_check(),
+            "task_policy": {
+                "enabled": self.task_policies is not None,
+                "mode": self.settings.task_policy_mode,
+                "out_of_scope": self.settings.task_policy_out_of_scope,
+            },
+            "sanitization": {
+                "enabled": self.settings.sanitization_enabled,
+                "mode": self.settings.sanitization_mode,
+                "max_result_bytes": self.settings.sanitization_max_result_bytes,
+            },
+            "content_inspection": {
+                "enabled": self.settings.content_inspection_enabled,
+                "mode": self.settings.content_inspection_mode,
+            },
             **self.store.status_counts(),
         }
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1.0",
+            "event_schema_versions": ["1.0", "1.1"],
+            "task_policy": {"enabled": self.task_policies is not None, "api_version": "1.0"},
+            "sanitization": {
+                "enabled": self.settings.sanitization_enabled,
+                "mode": self.settings.sanitization_mode,
+                "pattern_digest": SANITIZATION_PATTERN_DIGEST,
+                "tool_result_persist_required": True,
+                "before_message_write_fallback": True,
+                "max_result_bytes": self.settings.sanitization_max_result_bytes,
+            },
+            "content_inspection": {
+                "enabled": self.settings.content_inspection_enabled,
+                "mode": self.settings.content_inspection_mode,
+                "skill": True,
+                "skill_install_hook": True,
+                "skill_startup_root_scan": True,
+                "skill_authoritative_use_identity": False,
+                "skill_runtime_identity_required_for_binding": True,
+                "mcp_descriptor_registration_hook": False,
+                "mcp_proxy_required": True,
+                "mcp_proxy_transports": ["stdio"],
+                "mcp_unprotected_transports": ["sse", "streamable_http"],
+            },
+        }
+
+    def capture_task_policy(
+        self, prompt: str, session_key: str, agent_id: str,
+        parent_session_key: str | None = None, origin: Any = None,
+    ) -> Any:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        policy = self.task_policies.capture(
+            prompt=prompt, session_key=session_key, agent_id=agent_id,
+            parent_session_key=parent_session_key,
+            origin=origin,
+        )
+        self.store.record_operator_action(
+            "task_policy.capture", "openclaw", "task_policy", str(policy.task_policy_id),
+            {"session_key": session_key, "revision": policy.revision, "digest": policy.policy_digest, "status": policy.status.value},
+        )
+        event_name = "task_policy.activated" if policy.status == TaskPolicyStatus.ACTIVE else "task_policy.candidate"
+        self._emit(event_name, {
+            "task_policy_id": str(policy.task_policy_id), "session_key": session_key,
+            "revision": policy.revision, "digest": policy.policy_digest, "status": policy.status.value,
+        })
+        return policy
+
+    def get_task_policy(self, session_key: str, status: str | None = None) -> Any:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        parsed = TaskPolicyStatus(status) if status else None
+        policy = self.task_policies.get(session_key, parsed)
+        if policy is None:
+            raise TaskPolicyError("task policy not found")
+        return policy
+
+    def get_task_policy_view(self, session_key: str) -> dict[str, Any]:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        return self.task_policies.session_view(session_key)
+
+    def activate_task_policy(
+        self, session_key: str, candidate_digest: str,
+        expected_active_revision: int | None, operator: str,
+    ) -> Any:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        policy = self.task_policies.activate(session_key, candidate_digest, expected_active_revision, operator)
+        self.store.record_operator_action(
+            "task_policy.activate", operator, "task_policy", str(policy.task_policy_id),
+            {"session_key": session_key, "revision": policy.revision, "digest": policy.policy_digest},
+        )
+        self._emit("task_policy.activated", {
+            "task_policy_id": str(policy.task_policy_id), "session_key": session_key,
+            "revision": policy.revision, "digest": policy.policy_digest,
+        })
+        return policy
+
+    def reject_task_policy(self, session_key: str, candidate_digest: str, operator: str) -> Any:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        policy = self.task_policies.reject(session_key, candidate_digest, operator)
+        self.store.record_operator_action(
+            "task_policy.reject", operator, "task_policy", str(policy.task_policy_id),
+            {"session_key": session_key, "revision": policy.revision, "digest": policy.policy_digest},
+        )
+        self._emit("task_policy.rejected", {
+            "task_policy_id": str(policy.task_policy_id), "session_key": session_key,
+            "revision": policy.revision,
+        })
+        return policy
+
+    def revise_task_policy_content(
+        self, session_key: str, kind: str, name: str, content_digest: str,
+        expected_active_revision: int, operator: str, artifact_digest: str | None = None,
+    ) -> Any:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        inspection_digest = artifact_digest or content_digest
+        if self.inspections.effective_decision(inspection_digest, session_key) != "ALLOW":
+            raise TaskPolicyError("content inspection is not approved for this digest")
+        policy = self.task_policies.revise_content(
+            session_key, kind, name, content_digest, expected_active_revision,
+        )
+        self.store.record_operator_action(
+            "task_policy.revise_content", operator, "task_policy", str(policy.task_policy_id),
+            {"session_key": session_key, "kind": kind, "name": name, "content_digest": content_digest},
+        )
+        self._emit("task_policy.candidate", {
+            "task_policy_id": str(policy.task_policy_id), "session_key": session_key,
+            "revision": policy.revision, "digest": policy.policy_digest,
+        })
+        return policy
+
+    def close_task_policy(self, session_key: str, operator: str) -> dict[str, Any]:
+        if self.task_policies is None:
+            raise TaskPolicyError("task policy support is disabled")
+        closed = self.task_policies.close(session_key, operator)
+        self.store.record_operator_action(
+            "task_policy.close", operator, "task_policy", session_key, {"closed": closed},
+        )
+        self._emit("task_policy.closed", {"session_key": session_key, "closed": closed})
+        return {"session_key": session_key, "closed": closed}
 
     def close(self) -> None:
         self.store.close()

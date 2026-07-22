@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guardagent.local/schemas/task-policy.schema.json",
+  "title": "GuardAgent Session Task Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "task_policy_id", "session_key", "agent_id", "revision",
+    "status", "policy_digest", "base_policy_digest", "objective", "tools",
+    "files", "network", "commands", "skills", "mcp", "limits",
+    "provenance", "created_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "task_policy_id": {"type": "string", "format": "uuid"},
+    "session_key": {"type": "string", "minLength": 1, "maxLength": 512},
+    "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "parent_session_key": {"type": ["string", "null"], "maxLength": 512},
+    "parent_policy_digest": {"type": ["string", "null"]},
+    "revision": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["candidate", "revision_candidate", "active", "rejected", "superseded", "expired", "closed"]},
+    "policy_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "base_policy_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "source_digest"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1, "maxLength": 512},
+        "source_digest": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "tools": {"$ref": "#/$defs/toolRules"},
+    "files": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "write", "deny"],
+      "properties": {
+        "read": {"$ref": "#/$defs/stringList"},
+        "write": {"$ref": "#/$defs/stringList"},
+        "deny": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "write", "deny"],
+      "properties": {
+        "read": {"$ref": "#/$defs/stringList"},
+        "write": {"$ref": "#/$defs/stringList"},
+        "deny": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_prefixes", "deny_prefixes", "approval_categories"],
+      "properties": {
+        "allow_prefixes": {"$ref": "#/$defs/stringList"},
+        "deny_prefixes": {"$ref": "#/$defs/stringList"},
+        "approval_categories": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_digests", "deny_names"],
+      "properties": {
+        "allow_digests": {"$ref": "#/$defs/stringList"},
+        "deny_names": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow_tools", "allow_descriptor_digests"],
+      "properties": {
+        "allow_tools": {"$ref": "#/$defs/stringList"},
+        "allow_descriptor_digests": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_tool_calls", "max_external_writes", "max_files_changed", "expires_at"],
+      "properties": {
+        "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "max_external_writes": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "max_files_changed": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generator", "generator_version"],
+      "properties": {
+        "generator": {"enum": ["deterministic", "hybrid"]},
+        "generator_version": {"type": "string", "minLength": 1},
+        "model": {"type": ["string", "null"]},
+        "prompt_digest": {"type": ["string", "null"]},
+        "origin_channel": {"type": ["string", "null"]},
+        "origin_sender_digest": {"type": ["string", "null"]},
+        "origin_is_local_operator": {"type": "boolean"}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "activated_at": {"type": ["string", "null"], "format": "date-time"},
+    "closed_at": {"type": ["string", "null"], "format": "date-time"}
+  },
+  "$defs": {
+    "stringList": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "toolRules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow", "deny"],
+      "properties": {
+        "allow": {"$ref": "#/$defs/stringList"},
+        "deny": {"$ref": "#/$defs/stringList"}
+      }
+    }
+  }
+}

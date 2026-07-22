@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -9,18 +10,18 @@ from pathlib import Path
 from typing import Any
 
 
+_PATTERN_DOCUMENT = json.loads((Path(__file__).parent / "sanitization" / "patterns.json").read_text(encoding="utf-8"))
 SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")),
-    ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")),
-    ("openai_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
-    ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
-    ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
-    ("authorization", re.compile(r"(?i)\b(?:authorization|api[_-]?key|token|password|cookie)\s*[:=]\s*[^\s,;]+")),
-    ("connection_string", re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s]+")),
-    ("cn_id", re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")),
-    ("bank_card", re.compile(r"(?<!\d)(?:\d[ -]?){15,18}\d(?!\d)")),
+    (
+        str(item["id"]),
+        re.compile(str(item["regex"]), re.IGNORECASE if item.get("ignore_case") else 0),
+    )
+    for item in _PATTERN_DOCUMENT["patterns"]
 ]
+SENSITIVE_FIELD_TOKENS = tuple(str(item).lower() for item in _PATTERN_DOCUMENT["sensitive_field_tokens"])
+SANITIZATION_PATTERN_DIGEST = "sha256:" + hashlib.sha256(
+    json.dumps(_PATTERN_DOCUMENT, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+).hexdigest()
 OPTIONAL_PATTERNS = {
     "phone": ("phone", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
     "email": ("email", re.compile(r"(?i)(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])")),
@@ -41,6 +42,11 @@ def digest_payload(payload: Any) -> str:
     return f"sha256:{sha256_bytes(encoded)}"
 
 
+def hmac_digest_payload(payload: Any, key: bytes) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode()
+    return f"hmac-sha256:{hmac.new(key, encoded, hashlib.sha256).hexdigest()}"
+
+
 def summarize_value(value: Any) -> Any:
     if isinstance(value, str):
         return {"type": "string", "len": len(value), "sha256": sha256_bytes(value.encode())[:16]}
@@ -58,7 +64,7 @@ def summarize_mapping(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _secret_marker(kind: str, value: str) -> str:
-    return f'<SECRET type="{kind}" len="{len(value)}" sha256="{sha256_bytes(value.encode())[:12]}">'
+    return f'<GUARD_REDACTED type="{kind}" length="{len(value)}">'
 
 
 def build_extra_patterns(config: dict[str, Any] | None) -> list[tuple[str, re.Pattern[str]]]:
@@ -86,7 +92,7 @@ def redact_text(value: str, extra_patterns: list[tuple[str, re.Pattern[str]]] | 
 
 def sanitize(value: Any, key: str = "", extra_patterns: list[tuple[str, re.Pattern[str]]] | None = None) -> tuple[Any, list[str]]:
     classifications: list[str] = []
-    if any(token in key.lower() for token in ("token", "secret", "password", "cookie", "authorization", "pairing")):
+    if any(token in key.lower() for token in SENSITIVE_FIELD_TOKENS):
         text = str(value)
         return _secret_marker("sensitive_field", text), ["sensitive_field"]
     if isinstance(value, str):
@@ -127,3 +133,22 @@ def ensure_token(path: Path) -> str:
     except OSError:
         pass
     return token
+
+
+def ensure_hmac_key(path: Path) -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            key = bytes.fromhex(path.read_text(encoding="ascii").strip())
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("GuardAgent HMAC key file is invalid") from exc
+        if len(key) < 32:
+            raise RuntimeError("GuardAgent HMAC key file is invalid")
+        return key
+    key = secrets.token_bytes(32)
+    path.write_text(key.hex() + "\n", encoding="ascii")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return key

@@ -5,6 +5,10 @@ export type GuardConfig = {
   timeoutMs?: number;
   gatewayId?: string;
   observeInputInjection?: boolean;
+  captureTaskPolicy?: boolean;
+  sanitizationMode?: "disabled" | "observe" | "enforce";
+  contentInspectionMode?: "disabled" | "observe" | "enforce";
+  skillRoots?: string[];
 };
 
 export type GuardDecision = {
@@ -19,6 +23,12 @@ export type GuardDecision = {
   approval_id?: string | null;
   expires_at?: string | null;
   rewritten_params?: Record<string, unknown> | null;
+  execution_params?: Record<string, unknown> | null;
+  transformation_plan?: Array<{ classification: string; action: string; scope?: string; source?: string }>;
+  transformation_digest?: string | null;
+  task_policy_digest?: string | null;
+  task_policy_revision?: number | null;
+  task_policy_verdict?: string | null;
 };
 
 export type HookEvent = Record<string, unknown> & {
@@ -32,4 +42,12 @@ export type HookEvent = Record<string, unknown> & {
   derivedPaths?: readonly string[];
   content?: string;
   payload?: Record<string, unknown>;
+  parentSessionKey?: string;
+  message?: unknown;
+  contentKind?: "native" | "skill" | "mcp";
+  contentName?: string;
+  contentDigest?: string;
+  artifactDigest?: string;
+  serverIdentity?: string;
+  contentSourcePath?: string;
 };

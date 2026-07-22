@@ -54,6 +54,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["database_integrity"], "ok")
 
+        capabilities = self.client.get("/v1/capabilities", headers=self.auth).json()
+        inspection = capabilities["content_inspection"]
+        self.assertFalse(inspection["skill_authoritative_use_identity"])
+        self.assertEqual(inspection["mcp_proxy_transports"], ["stdio"])
+        self.assertEqual(inspection["mcp_unprotected_transports"], ["sse", "streamable_http"])
+
     def test_decision_and_approval_endpoints(self) -> None:
         response = self.client.post("/v1/decisions/tool", headers=self.auth, json=self.request("git push origin main"))
         self.assertEqual(response.status_code, 200)
@@ -85,6 +91,41 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(validation.json()["valid"])
         simulation = self.client.post("/v1/policy/simulate", headers=self.auth, json=self.request("rm -rf /"))
         self.assertEqual(simulation.json()["decision"], "DENY")
+
+    def test_secret_bearing_external_write_returns_block_transformation(self) -> None:
+        body = self.request("ignored")
+        body["event"]["tool"] = {"name": "message_send", "kind": "tool"}
+        body["event"]["params"] = {
+            "to": "https://example.com/inbox",
+            "content": "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz123456",
+        }
+        response = self.client.post("/v1/decisions/message", headers=self.auth, json=body)
+        self.assertEqual(response.status_code, 200)
+        decision = response.json()
+        self.assertEqual(decision["decision"], "DENY")
+        self.assertIn("SECRET-EXFIL-001", decision["rule_ids"])
+        self.assertEqual({item["action"] for item in decision["transformation_plan"]}, {"block"})
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", response.text)
+
+    def test_sanitization_event_persists_metadata_only(self) -> None:
+        response = self.client.post(
+            "/v1/events/sanitization", headers=self.auth,
+            json={
+                "schema_version": "1.0", "request_id": "san-1", "sanitizer_event_id": "san-1",
+                "direction": "inbound", "session_key": "sha256:session", "tool_name": "web_fetch",
+                "classifications": ["github_token"],
+                "transformations": [{
+                    "json_path": "$.content", "classification": "github_token", "length": 40,
+                    "source": "value-pattern", "proposed_action": "redact", "ref": "event-local-1",
+                }],
+                "original_size": 100, "result_size": 80, "truncated": False, "blocked": False,
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        rows = self.client.app.state.service.store.list_sanitization_events("sha256:session")
+        self.assertEqual(rows[0]["classifications"], ["github_token"])
+        self.assertEqual(rows[0]["transformations"][0]["json_path"], "$.content")
+        self.assertEqual(self.client.app.state.service.store.sanitization_metrics()["total"], 1)
 
 
 if __name__ == "__main__":

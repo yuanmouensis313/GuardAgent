@@ -8,6 +8,9 @@ GuardAgent is a local, deterministic policy service and typed OpenClaw plugin fo
 - Typed OpenClaw hooks for tool calls, outbound messages, lifecycle events, and installation.
 - Fail-closed degraded behavior when the local policy service is unavailable.
 - Secret redaction, correlation controls, single-use approvals, and hash-chained SQLite audit records.
+- Session-scoped `R_task` policies with digest-bound confirmation, safe revisions, limits, and child-session inheritance.
+- Synchronous inbound/outbound data-path sanitization with execution transformation plans and sanitization audit.
+- Digest-bound Skill and MCP descriptor inspection; a fail-closed stdio MCP proxy removes rejected descriptors before model visibility.
 - Local Chinese web console for live approvals, event/session review, policy simulation and publishing, and diagnostics.
 - Unit, integration, adversarial, and performance tests for the Python service and TypeScript plugin.
 
@@ -22,6 +25,10 @@ guardd
 guardctl status
 guardctl ui
 ```
+
+The three new controls default to Observe. Inspect them with `guardctl task-policy`,
+`guardctl sanitization`, and `guardctl inspections`; do not enable their Enforce
+modes until the deployment gates have been completed.
 
 The service listens on `127.0.0.1:8787` by default. The generated bearer token is stored outside the workspace by default, under the current user's GuardAgent state directory. See `docs/DEPLOYMENT.md` before enabling Enforce mode.
 
@@ -68,6 +75,8 @@ Set `GUARDD_UI_ENABLED=false` to disable the browser control plane without disab
 ## Repository layout
 
 - `guardd/`: Python policy service, API, CLI, normalization, approvals, and audit storage.
+- `guardd/task_policy/`, `guardd/sanitization/`, `guardd/inspections/`: task scope, data-path, and content-admission controls.
+- `guardd/mcp_proxy.py`: digest-bound stdio MCP compatibility proxy.
 - `plugins/guard-openclaw/`: typed OpenClaw plugin source, tests, and runtime build.
 - `policies/`: default policy and JSON Schemas.
 - `config/`: conservative OpenClaw and execution-approval baselines.

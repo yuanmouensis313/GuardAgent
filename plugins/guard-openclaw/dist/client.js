@@ -1,51 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-const SECRET_KEY = /(token|secret|password|cookie|authorization|pairing)/i;
-const SECRET_VALUES = [
-    ["private_key", /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g],
-    ["jwt", /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/g],
-    ["api_key", /\b(?:sk-(?:proj-)?|sk-ant-|gh[pousr]_)[A-Za-z0-9_-]{20,}\b/g],
-];
-function marker(kind, value) {
-    const digest = createHash("sha256").update(value).digest("hex").slice(0, 12);
-    return `<SECRET type="${kind}" len="${value.length}" sha256="${digest}">`;
-}
+import { sanitizeValue } from "./sanitizer.js";
 export function redact(value, key = "") {
-    if (SECRET_KEY.test(key)) {
-        return { value: marker("sensitive_field", String(value)), classifications: ["sensitive_field"] };
-    }
-    if (typeof value === "string") {
-        const classifications = [];
-        let output = value;
-        for (const [kind, pattern] of SECRET_VALUES) {
-            output = output.replace(pattern, (matched) => {
-                classifications.push(kind);
-                return marker(kind, matched);
-            });
-        }
-        return { value: output, classifications: [...new Set(classifications)] };
-    }
-    if (Array.isArray(value)) {
-        const classifications = [];
-        const output = value.map((item) => {
-            const clean = redact(item);
-            classifications.push(...clean.classifications);
-            return clean.value;
-        });
-        return { value: output, classifications: [...new Set(classifications)] };
-    }
-    if (value && typeof value === "object") {
-        const classifications = [];
-        const output = {};
-        for (const [childKey, childValue] of Object.entries(value)) {
-            const clean = redact(childValue, childKey);
-            output[childKey] = clean.value;
-            classifications.push(...clean.classifications);
-        }
-        return { value: output, classifications: [...new Set(classifications)] };
-    }
-    return { value, classifications: [] };
+    const wrapped = key ? { [key]: value } : value;
+    const clean = sanitizeValue(wrapped);
+    return {
+        value: key && clean.value && typeof clean.value === "object" ? clean.value[key] : clean.value,
+        classifications: clean.classifications,
+    };
 }
 export function hashLocal(value) {
     if (value === undefined || value === null || value === "")
@@ -79,6 +42,7 @@ export function unifiedEvent(event, ctx, eventType, config, override) {
         gateway_id: config.gatewayId ?? "local-gateway",
         agent_id: String(sourceContext.agentId ?? "unknown"),
         session_key: sessionKey,
+        parent_session_key: hashLocal(sourceContext.parentSessionKey ?? event.parentSessionKey),
         session_id: hashLocal(sourceContext.sessionId),
         run_id: String(event.runId ?? sourceContext.runId ?? "") || undefined,
         tool_call_id: String(event.toolCallId ?? "") || undefined,
@@ -99,11 +63,18 @@ export function unifiedEvent(event, ctx, eventType, config, override) {
             guard_openclaw_version: "0.1.0",
             openclaw_version: sourceContext.openclawVersion,
         },
-        data_classification: clean.classifications,
+        data_classification: [...new Set([...clean.classifications, ...(override?.classifications ?? [])])],
         trace: {
             trace_id: sourceContext.traceId,
             span_id: sourceContext.spanId,
         },
+        content_identity: sourceContext.contentKind || event.contentKind ? {
+            kind: String(sourceContext.contentKind ?? event.contentKind),
+            name: String(sourceContext.contentName ?? event.contentName ?? event.toolName ?? "unknown"),
+            digest: String(sourceContext.contentDigest ?? event.contentDigest ?? "") || undefined,
+            artifact_digest: String(sourceContext.artifactDigest ?? event.artifactDigest ?? "") || undefined,
+            server_identity: String(sourceContext.serverIdentity ?? event.serverIdentity ?? "") || undefined,
+        } : undefined,
     };
 }
 export class GuardClient {
@@ -111,6 +82,10 @@ export class GuardClient {
     token;
     failures = 0;
     nextAttempt = 0;
+    capabilityError;
+    retryNow() {
+        this.nextAttempt = 0;
+    }
     queue = [];
     draining = false;
     static MAX_QUEUE = 256;
@@ -155,8 +130,44 @@ export class GuardClient {
         }
     }
     decide(event, message = false) {
+        if (this.capabilityError && this.config.sanitizationMode === "enforce") {
+            return Promise.reject(new Error(this.capabilityError));
+        }
         return this.request(message ? "/v1/decisions/message" : "/v1/decisions/tool", {
             schema_version: "1.0", request_id: randomUUID(), event,
+        });
+    }
+    async negotiateCapabilities(expectedPatternDigest) {
+        const capabilities = await this.request("/v1/capabilities", undefined, "GET");
+        const sanitization = capabilities.sanitization;
+        const actual = String(sanitization?.pattern_digest ?? "");
+        if (this.config.sanitizationMode === "enforce" && sanitization?.enabled !== true) {
+            this.capabilityError = "guardd sanitization is disabled while the plugin requires enforce mode";
+            throw new Error(this.capabilityError);
+        }
+        if (actual !== expectedPatternDigest) {
+            this.capabilityError = `sanitization pattern digest mismatch: plugin=${expectedPatternDigest} guardd=${actual || "missing"}`;
+            throw new Error(this.capabilityError);
+        }
+        if (sanitization?.tool_result_persist_required !== true) {
+            this.capabilityError = "guardd capability contract does not require tool_result_persist";
+            throw new Error(this.capabilityError);
+        }
+        this.capabilityError = undefined;
+    }
+    captureTaskPolicy(event, ctx) {
+        const normalized = unifiedEvent(event, ctx, "task.capture", this.config, {
+            toolName: "task_policy",
+            params: {},
+        });
+        return this.request("/v1/task-policies/capture", {
+            schema_version: "1.0",
+            request_id: randomUUID(),
+            session_key: normalized.session_key,
+            parent_session_key: normalized.parent_session_key,
+            agent_id: normalized.agent_id,
+            prompt: String(event.prompt ?? ""),
+            origin: normalized.origin,
         });
     }
     observe(path, body, method = "POST", critical = false) {

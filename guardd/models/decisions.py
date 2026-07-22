@@ -43,6 +43,13 @@ class Decision(BaseModel):
     expires_at: datetime | None = None
     parameter_digest: str
     sanitized_params: dict[str, Any] = Field(default_factory=dict)
+    execution_params: dict[str, Any] | None = None
     rewritten_params: dict[str, Any] | None = None
+    transformation_plan: list[dict[str, Any]] = Field(default_factory=list)
+    transformation_digest: str | None = None
     remediation: str | None = None
     approval_id: UUID | None = None
+    task_policy_digest: str | None = None
+    task_policy_revision: int | None = None
+    task_policy_verdict: str | None = None
+    content_verdict_digest: str | None = None

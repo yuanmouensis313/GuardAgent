@@ -69,6 +69,33 @@ class UiServiceTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_session_replay_excludes_lifecycle_and_reuses_normalized_evidence(self) -> None:
+        service = GuardService(self.settings)
+        session_key = "replay-normalized"
+        lifecycle = GuardEvent(
+            event_type="session.start", source="test", agent_id="main", session_key=session_key,
+        )
+        action = GuardEvent(
+            event_type="tool.before", source="test", agent_id="main", session_key=session_key,
+            tool=ToolDescriptor(name="exec", kind="shell", input_kind="powershell"),
+            params={"command": "git status"},
+        )
+        try:
+            service.session_event(lifecycle)
+            original = service.decide(action)
+            self.assertIn("GIT-READ-001", original.rule_ids)
+
+            result = service.regression_policy(self.policy_path.read_text(encoding="utf-8"), session_key)
+
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["evidence"], "recorded_sanitized_normalized")
+            self.assertEqual(len(result["results"]), 1)
+            self.assertEqual(result["results"][0]["event_id"], str(action.event_id))
+            self.assertEqual(result["results"][0]["decision"], "ALLOW")
+            self.assertIn("GIT-READ-001", result["results"][0]["rule_ids"])
+        finally:
+            service.close()
+
     def test_policy_publish_rolls_back_when_audit_commit_fails(self) -> None:
         service = GuardService(self.settings)
         original_text = self.policy_path.read_text(encoding="utf-8")

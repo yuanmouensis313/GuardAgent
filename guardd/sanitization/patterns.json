@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "max_scan_bytes": 1048576,
+  "sensitive_field_tokens": ["token", "secret", "password", "cookie", "authorization", "pairing", "private_key", "private-key"],
+  "patterns": [
+    {"id": "private_key", "regex": "-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----(?:[\\s\\S]{0,100000}?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)?", "ignore_case": false},
+    {"id": "jwt", "regex": "\\beyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\b", "ignore_case": false},
+    {"id": "github_token", "regex": "\\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\\b", "ignore_case": false},
+    {"id": "anthropic_key", "regex": "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", "ignore_case": false},
+    {"id": "openai_key", "regex": "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", "ignore_case": false},
+    {"id": "aws_access_key", "regex": "\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b", "ignore_case": false},
+    {"id": "authorization", "regex": "\\b(?:authorization|api[_-]?key|token|password|cookie)\\s*[:=]\\s*[^\\s,;]+", "ignore_case": true},
+    {"id": "connection_string", "regex": "\\b(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis)://[^\\s]+", "ignore_case": true},
+    {"id": "cn_id", "regex": "(?<!\\d)\\d{17}[0-9Xx](?!\\d)", "ignore_case": false},
+    {"id": "bank_card", "regex": "(?<!\\d)(?:\\d[ -]?){15,18}\\d(?!\\d)", "ignore_case": false}
+  ]
+}

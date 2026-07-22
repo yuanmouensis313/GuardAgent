@@ -28,16 +28,19 @@ from guardd.api.ui.schemas import (
     SessionRequest,
     SettingsResponse,
     StatusResponse,
+    TaskPolicyDecisionRequest,
     UiErrorEnvelope,
     UiSessionResponse,
 )
 from guardd.approvals.manager import ApprovalError
 from guardd.config import Settings
 from guardd.diagnostics import DiagnosticJobError, DiagnosticJobManager
+from guardd.inspections import InspectionConfirmationRequest, InspectionError
 from guardd.models.events import GuardEvent
 from guardd.policy import PolicyValidationError
 from guardd.realtime import EventBus
 from guardd.service import GuardService
+from guardd.task_policy import TaskPolicyError
 
 
 def _now() -> str:
@@ -196,6 +199,56 @@ def create_ui_router(
             raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "event not found"})
         return {"item": result, "server_time": _now()}
 
+    @router.get("/sanitization/events", response_model=ItemsResponse)
+    def sanitization_events(
+        session_key: str | None = None, limit: int = Query(default=100, ge=1, le=500),
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        return {
+            "items": service.store.list_sanitization_events(session_key, limit),
+            "server_time": _now(),
+        }
+
+    @router.get("/sanitization/metrics", response_model=ItemResponse)
+    def sanitization_metrics(_: UiSession = Depends(session)) -> dict[str, Any]:
+        return {"item": service.store.sanitization_metrics(), "server_time": _now()}
+
+    @router.get("/inspections", response_model=ItemsResponse)
+    def inspections(
+        kind: str | None = None, limit: int = Query(default=100, ge=1, le=500),
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        return {"items": service.store.list_inspections(kind, limit), "server_time": _now()}
+
+    @router.get("/inspections/{content_digest}", response_model=ItemResponse)
+    def inspection_detail(content_digest: str, _: UiSession = Depends(session)) -> dict[str, Any]:
+        try:
+            return {"item": service.inspections.get(content_digest), "server_time": _now()}
+        except InspectionError as exc:
+            raise HTTPException(404, detail={"code": "NOT_FOUND", "message": str(exc)}) from exc
+
+    @router.post("/inspections/{content_digest}/confirm", response_model=ItemResponse)
+    def confirm_content_inspection(
+        content_digest: str, body: InspectionConfirmationRequest,
+        current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            request = body.model_copy(update={"operator": current.operator})
+            return {"item": service.confirm_inspection(content_digest, request), "server_time": _now()}
+        except InspectionError as exc:
+            raise HTTPException(409, detail={"code": "INSPECTION_CONFLICT", "message": str(exc)}) from exc
+
+    @router.post("/inspections/{content_digest}/invalidate", response_model=ItemResponse)
+    def invalidate_content_inspection(
+        content_digest: str, _: OperatorRequest, current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            result = service.inspections.invalidate(content_digest)
+            service.store.record_operator_action("inspection.invalidate", current.operator, "content_artifact", content_digest)
+            return {"item": result, "server_time": _now()}
+        except InspectionError as exc:
+            raise HTTPException(409, detail={"code": "INSPECTION_CONFLICT", "message": str(exc)}) from exc
+
     @router.get("/approvals", response_model=PageResponse)
     def list_approvals(
         approval_status: str | None = Query(default="pending", alias="status"), risk: str | None = None,
@@ -260,6 +313,37 @@ def create_ui_router(
         result = service.regression_policy(policy, session_key)
         service.store.record_operator_action("session.replay", current.operator, "session", session_key, {"candidate": body.policy is not None})
         return {"item": result, "server_time": _now()}
+
+    @router.get("/sessions/{session_key}/task-policy", response_model=ItemResponse)
+    def session_task_policy(session_key: str, _: UiSession = Depends(session)) -> dict[str, Any]:
+        try:
+            return {"item": service.get_task_policy_view(session_key), "server_time": _now()}
+        except TaskPolicyError:
+            return {"item": None, "server_time": _now()}
+
+    @router.post("/sessions/{session_key}/task-policy/activate", response_model=ItemResponse)
+    def activate_session_task_policy(
+        session_key: str, body: TaskPolicyDecisionRequest,
+        current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            result = service.activate_task_policy(
+                session_key, body.candidate_digest, body.expected_active_revision, current.operator,
+            )
+            return {"item": result, "server_time": _now()}
+        except TaskPolicyError as exc:
+            raise HTTPException(409, detail={"code": "TASK_POLICY_CONFLICT", "message": str(exc)}) from exc
+
+    @router.post("/sessions/{session_key}/task-policy/reject", response_model=ItemResponse)
+    def reject_session_task_policy(
+        session_key: str, body: TaskPolicyDecisionRequest,
+        current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            result = service.reject_task_policy(session_key, body.candidate_digest, current.operator)
+            return {"item": result, "server_time": _now()}
+        except TaskPolicyError as exc:
+            raise HTTPException(409, detail={"code": "TASK_POLICY_CONFLICT", "message": str(exc)}) from exc
 
     @router.get("/policy", response_model=ItemResponse)
     def policy(_: UiSession = Depends(session)) -> dict[str, Any]:
@@ -345,6 +429,12 @@ def create_ui_router(
             "database": str(settings.db_path), "approval_ttl_seconds": settings.approval_ttl_seconds,
             "audit_retention_days": settings.audit_retention_days, "plugin_timeout_ms": settings.plugin_timeout_ms,
             "request_limit_bytes": settings.request_limit_bytes, "ui_enabled": settings.ui_enabled,
+            "task_policy_enabled": settings.task_policy_enabled, "task_policy_mode": settings.task_policy_mode,
+            "task_policy_ttl_minutes": settings.task_policy_ttl_minutes,
+            "sanitization_enabled": settings.sanitization_enabled, "sanitization_mode": settings.sanitization_mode,
+            "sanitization_max_result_bytes": settings.sanitization_max_result_bytes,
+            "content_inspection_enabled": settings.content_inspection_enabled,
+            "content_inspection_mode": settings.content_inspection_mode,
         }
         sources = {
             "host": "GUARDD_HOST", "port": "GUARDD_PORT", "workspace": "GUARD_AGENT_WORKSPACE",
@@ -352,6 +442,12 @@ def create_ui_router(
             "database": "derived from GUARD_AGENT_STATE_DIR", "approval_ttl_seconds": "GUARDD_APPROVAL_TTL",
             "audit_retention_days": "GUARDD_RETENTION_DAYS", "plugin_timeout_ms": "GUARDD_PLUGIN_TIMEOUT_MS",
             "request_limit_bytes": "GUARDD_REQUEST_LIMIT", "ui_enabled": "GUARDD_UI_ENABLED",
+            "task_policy_enabled": "GUARD_TASK_POLICY_ENABLED", "task_policy_mode": "GUARD_TASK_POLICY_MODE",
+            "task_policy_ttl_minutes": "GUARD_TASK_POLICY_TTL_MINUTES",
+            "sanitization_enabled": "GUARD_SANITIZATION_ENABLED", "sanitization_mode": "GUARD_SANITIZATION_MODE",
+            "sanitization_max_result_bytes": "GUARD_SANITIZATION_MAX_RESULT_BYTES",
+            "content_inspection_enabled": "GUARD_CONTENT_INSPECTION_ENABLED",
+            "content_inspection_mode": "GUARD_CONTENT_INSPECTION_MODE",
         }
         return {"item": item, "sources": sources, "restart_required": True, "server_time": _now()}
 
