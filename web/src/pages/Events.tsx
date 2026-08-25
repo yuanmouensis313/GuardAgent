@@ -1,7 +1,7 @@
 import { FormEvent, useState } from "react";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { api, formatTime, short } from "../api";
+import { api, formatTime, postBody, short } from "../api";
 import { Badge, DataTable, Drawer, ErrorState, JsonView, KeyValue, Loading, PageHeader, Panel } from "../components";
 
 type EventFilters = {
@@ -32,12 +32,15 @@ export default function Events() {
   const [selected, setSelected] = useState<string | undefined>(() => searchParams.get("event") || undefined);
   const query = useInfiniteQuery({ queryKey: ["events", applied], initialPageParam: "", queryFn: ({ pageParam }) => api<any>(`/events?${searchFor(applied, pageParam)}`), getNextPageParam: last => last.next_cursor || undefined });
   const detail = useQuery({ queryKey: ["event", selected], queryFn: () => api<any>(`/events/${selected}`), enabled: !!selected });
+  const reviewMutation = useMutation({
+    mutationFn: () => api<any>(`/events/${selected}/review`, { method: "POST", body: postBody() }),
+  });
   const rows = query.data?.pages.flatMap(page => page.items) || [];
   const update = (key: keyof EventFilters, value: string) => setFilters(current => ({ ...current, [key]: value }));
   const submit = (event: FormEvent) => { event.preventDefault(); setApplied({ ...filters }); setSearchParams(Object.fromEntries(Object.entries(filters).filter(([, value]) => value))); };
   const reset = () => { setFilters(initialFilters); setApplied(initialFilters); setSearchParams({}); };
   const selectEvent = (eventId?: string) => {
-    setSelected(eventId); const next = new URLSearchParams(searchParams);
+    setSelected(eventId); reviewMutation.reset(); const next = new URLSearchParams(searchParams);
     if (eventId) next.set("event", eventId); else next.delete("event"); setSearchParams(next, { replace: true });
   };
   return <>
@@ -67,7 +70,9 @@ export default function Events() {
       const item = detail.data?.item; if (!item) return null;
       return <div className="detail-stack"><div className="detail-hero"><Badge value={item.decision || "none"} />{item.would_decide && <Badge value={item.would_decide} />}<Badge value={item.risk || "none"} /><code>{short(item.event_id, 18)}</code></div>
         <KeyValue items={[["发生时间", formatTime(item.occurred_at)], ["事件类型", item.event_type], ["工具", item.tool_name || "—"], ["Agent", item.agent_id], ["会话", <code>{item.session_key}</code>], ["规则", item.rule_ids.map((value: string) => <code key={value}>{value} </code>)], ["原因", item.reason || "—"], ["策略", <code>{short(item.policy_digest, 24)}</code>], ["数据分类", (item.event?.data_classification || []).join(", ") || "none"], ["审计哈希", <code>{item.event_hash}</code>], ["前序哈希", <code>{item.previous_hash || "genesis"}</code>]]} />
-        <div className="inline-actions"><button className="button ghost" onClick={() => navigate(`/policy?event=${item.event_id}`)}>用此脱敏事件模拟策略</button><button className="text-button" onClick={() => navigate(`/sessions?session=${encodeURIComponent(item.session_key)}`)}>查看会话</button></div>
+        <div className="inline-actions"><button className="button ghost" onClick={() => navigate(`/policy?event=${item.event_id}`)}>用此脱敏事件模拟策略</button><button className="button ghost" disabled={reviewMutation.isPending} onClick={() => reviewMutation.mutate()}>{reviewMutation.isPending ? "正在提交…" : "请求语义复核"}</button><button className="text-button" onClick={() => navigate(`/sessions?session=${encodeURIComponent(item.session_key)}`)}>查看会话</button></div>
+        {reviewMutation.data && <div className="notice"><strong>复核已受理</strong><span>状态：{reviewMutation.data.item?.status}；Review ID：<code>{reviewMutation.data.item?.review_id}</code></span></div>}
+        {reviewMutation.error && <ErrorState error={reviewMutation.error} />}
         <h3>归一化事件（已脱敏）</h3><JsonView value={item.event} /><h3>工具结果</h3><JsonView value={item.tool_results} />{item.approval && <><h3>审批</h3><JsonView value={item.approval} /></>}
       </div>;
     })()}</Drawer>}

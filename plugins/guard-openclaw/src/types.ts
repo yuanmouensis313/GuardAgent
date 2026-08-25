@@ -29,6 +29,12 @@ export type GuardDecision = {
   task_policy_digest?: string | null;
   task_policy_revision?: number | null;
   task_policy_verdict?: string | null;
+  base_decision?: "ALLOW" | "DENY" | "REQUIRE_APPROVAL" | "OBSERVE" | null;
+  review_id?: string | null;
+  review_status?: string | null;
+  review_verdict?: string | null;
+  review_digest?: string | null;
+  decision_sources?: Array<{ source: string; digest: string; decision: string }>;
 };
 
 export type HookEvent = Record<string, unknown> & {

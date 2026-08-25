@@ -6,13 +6,19 @@ Thank you for helping improve GuardAgent. Security-sensitive changes should be s
 
 Prerequisites:
 
-- Python 3.12 or newer
+- uv 0.11.24 or newer
 - Node.js 22 or newer
 
-Install the Python package and test dependencies:
+Synchronize the locked Python environment and test dependencies:
 
 ```powershell
-python -m pip install -e ".[test]"
+uv sync --extra test
+```
+
+Start the development service from the repository root:
+
+```powershell
+uv run guardagent
 ```
 
 Install the plugin dependencies without running dependency lifecycle scripts:
@@ -27,7 +33,7 @@ npm ci --ignore-scripts
 Run the Python suite from the repository root:
 
 ```powershell
-python -m pytest
+uv run pytest
 ```
 
 Run the plugin checks:

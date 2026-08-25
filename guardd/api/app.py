@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import FileResponse
 from starlette.types import Scope
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from guardd.api.ui import create_ui_router
 from guardd.api.ui.auth import UiAuthManager
@@ -55,6 +55,12 @@ class ApprovalResolution(BaseModel):
     operator: str = "local-operator"
 
 
+class ReviewSecurityOverride(ApprovalResolution):
+    parameter_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    reason: str = Field(min_length=10, max_length=1000)
+    confirmation: str
+
+
 class SPAStaticFiles(StaticFiles):
     def _index_response(self) -> HTMLResponse:
         nonce = secrets.token_urlsafe(24)
@@ -87,6 +93,7 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
     settings = settings or Settings.from_env()
     service = service or GuardService(settings)
     token = ensure_token(settings.token_path)
+    security_override_token = ensure_token(settings.security_override_token_path)
     event_bus = EventBus()
     service.set_event_sink(event_bus.publish)
     ui_auth = UiAuthManager()
@@ -210,6 +217,18 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
         if not authorization or not authorization.startswith("Bearer ") or not hmac.compare_digest(authorization[7:], token):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token")
 
+    def authenticate_security_override(
+        x_guard_security_override: str | None = Header(default=None),
+    ) -> None:
+        if not x_guard_security_override or not hmac.compare_digest(
+            x_guard_security_override,
+            security_override_token,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="independent security override credential required",
+            )
+
     @app.get("/v1/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "schema_version": "1.0"}
@@ -221,6 +240,36 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
     @app.get("/v1/capabilities", dependencies=[Depends(authenticate)])
     def get_capabilities() -> Any:
         return service.capabilities()
+
+    @app.get("/v1/llm/health", dependencies=[Depends(authenticate)])
+    def llm_health() -> Any:
+        return service.llm_health()
+
+    @app.get("/v1/llm/metrics", dependencies=[Depends(authenticate)])
+    def llm_metrics() -> Any:
+        return service.llm_metrics()
+
+    @app.get("/v1/llm-reviews", dependencies=[Depends(authenticate)])
+    def llm_reviews(
+        review_status: str | None = None,
+        session_key: str | None = None,
+        limit: int = 100,
+    ) -> Any:
+        return service.list_llm_reviews(review_status, session_key, limit)
+
+    @app.get("/v1/llm-reviews/{review_id}", dependencies=[Depends(authenticate)])
+    def llm_review(review_id: UUID) -> Any:
+        try:
+            return service.get_llm_review(review_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/v1/llm-reviews/{review_id}/retry", dependencies=[Depends(authenticate)])
+    def retry_llm_review(review_id: UUID, body: ApprovalResolution) -> Any:
+        try:
+            return service.retry_llm_review(review_id, body.operator)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.post("/v1/decisions/tool", dependencies=[Depends(authenticate)])
     def tool_decision(request: DecisionRequest) -> Any:
@@ -332,6 +381,29 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
     def deny(approval_id: UUID, body: ApprovalResolution) -> Any:
         return resolve(approval_id, body, False)
 
+    @app.post(
+        "/v1/approvals/{approval_id}/override-review-block",
+        dependencies=[Depends(authenticate), Depends(authenticate_security_override)],
+    )
+    def override_review_block(approval_id: UUID, body: ReviewSecurityOverride) -> Any:
+        try:
+            return service.override_review_block(
+                approval_id,
+                parameter_digest=body.parameter_digest,
+                operator=body.operator,
+                reason=body.reason,
+                confirmation=body.confirmation,
+            )
+        except (ApprovalError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/v1/events/{event_id}/review", dependencies=[Depends(authenticate)])
+    def request_event_review(event_id: UUID, body: ApprovalResolution) -> Any:
+        try:
+            return service.request_event_review(event_id, body.operator)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post("/v1/policy/validate", dependencies=[Depends(authenticate)])
     def validate_policy(body: PolicyText) -> Any:
         return service.validate_policy(body.policy)
@@ -353,6 +425,32 @@ def create_app(settings: Settings | None = None, service: GuardService | None = 
             )
         except TaskPolicyError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/v1/task-policy-generations", dependencies=[Depends(authenticate)])
+    def list_task_policy_generations(
+        session_key: str | None = None,
+        generation_status: str | None = None,
+        limit: int = 100,
+    ) -> Any:
+        return service.list_task_policy_generations(session_key, generation_status, limit)
+
+    @app.get("/v1/task-policy-generations/{generation_id}", dependencies=[Depends(authenticate)])
+    def get_task_policy_generation(generation_id: UUID) -> Any:
+        try:
+            return service.get_task_policy_generation(generation_id)
+        except TaskPolicyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/v1/task-policy-generations/{generation_id}/retry", dependencies=[Depends(authenticate)])
+    def retry_task_policy_generation(generation_id: UUID, body: ApprovalResolution) -> Any:
+        try:
+            return service.retry_task_policy_generation(generation_id, body.operator)
+        except TaskPolicyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/v1/sessions/{session_key}/safety-memory", dependencies=[Depends(authenticate)])
+    def get_safety_memory(session_key: str) -> Any:
+        return service.safety_memory(session_key)
 
     @app.get("/v1/task-policies/{session_key}", dependencies=[Depends(authenticate)])
     def get_task_policy(session_key: str, policy_status: str | None = None) -> Any:

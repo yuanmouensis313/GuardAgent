@@ -54,6 +54,11 @@ def run_doctor(settings: Settings) -> dict[str, Any]:
     checks.append(Check("loopback-bind", "pass" if settings.host in {"127.0.0.1", "::1", "localhost"} else "fail", settings.host))
     checks.append(Check("policy-file", "pass" if settings.policy_path.is_file() else "fail", str(settings.policy_path)))
     checks.append(Check("token-file", "pass" if settings.token_path.is_file() else "warn", str(settings.token_path)))
+    checks.append(Check(
+        "security-override-token-file",
+        "pass" if settings.security_override_token_path.is_file() else "warn",
+        str(settings.security_override_token_path),
+    ))
     root = Path(__file__).parents[1]
     generated_patterns = root / "plugins" / "guard-openclaw" / "src" / "generated-sanitization-patterns.ts"
     pattern_source_available = generated_patterns.is_file()

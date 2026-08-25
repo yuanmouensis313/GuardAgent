@@ -13,6 +13,10 @@ from guardd.config import Settings
 from guardd.models.events import GuardEvent, ToolDescriptor
 from guardd.policy import PolicyEngine, PolicyLoader
 from guardd.service import GuardService
+from guardd.agents.safety_review import SafetyReviewAgent
+from guardd.audit import AuditStore
+from guardd.llm import PromptRegistry, SafetyReviewValidator
+from tests.unit.test_llm_jobs import FakeProvider, review_input
 
 
 ROOT = Path(__file__).parents[2]
@@ -23,6 +27,45 @@ def health_event(session: str) -> GuardEvent:
 
 
 class PerformanceTests(unittest.TestCase):
+    def test_llm_review_enqueue_and_cache_hit_latency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = AuditStore(root / "guard.db", root / "emergency.log")
+            agent = SafetyReviewAgent(
+                store=store, provider=FakeProvider(), model="performance-fake",
+                prompt=PromptRegistry().load("safety-review", "1"),
+                validator=SafetyReviewValidator(), base_policy_digest=f"sha256:{'a' * 64}",
+                max_concurrency=1, queue_capacity=1000,
+            )
+            event, _, document = review_input()
+            agent.start()
+            try:
+                reference = agent.enqueue(document, subject_id=str(event.event_id), priority=1)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if agent.get_cached(document) is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(agent.get_cached(document))
+                cache_latencies = []
+                for _ in range(500):
+                    started = time.perf_counter_ns()
+                    agent.get_cached(document)
+                    cache_latencies.append((time.perf_counter_ns() - started) / 1_000_000)
+                self.assertLess(sorted(cache_latencies)[474], 5)
+                agent.close()
+                enqueue_latencies = []
+                for index in range(100):
+                    changed = document.model_copy(deep=True)
+                    changed.objective.summary = f"Performance review variant {index}"
+                    started = time.perf_counter_ns()
+                    agent.enqueue(changed, subject_id=f"perf-{index}", priority=1)
+                    enqueue_latencies.append((time.perf_counter_ns() - started) / 1_000_000)
+                self.assertLess(sorted(enqueue_latencies)[94], 10)
+            finally:
+                agent.close()
+                store.close()
+
     def test_deterministic_decision_latency_and_100_concurrent_requests(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             engine = PolicyEngine(PolicyLoader().load(ROOT / "policies/default.yaml"), Path(temp))

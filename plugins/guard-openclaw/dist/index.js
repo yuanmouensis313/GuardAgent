@@ -158,6 +158,12 @@ async function beforeTool(event, ctx, config) {
                 blockReason: `${decision.reason} [R_task revision=${revision}; digest=${digest}; run guardctl task-policy approve --session <session> --digest <full-digest>, then retry]`,
             };
         }
+        if (decision.rule_ids.includes("LLM-REVIEW-PENDING-001")) {
+            return {
+                block: true,
+                blockReason: `${decision.reason} [semantic review=${decision.review_status ?? "pending"}; review_id=${decision.review_id ?? "unavailable"}; retry the exact action after review completes]`,
+            };
+        }
         const execution = executionView(decision, rawParams, local, config);
         if (execution.blockReason)
             return { block: true, blockReason: execution.blockReason };

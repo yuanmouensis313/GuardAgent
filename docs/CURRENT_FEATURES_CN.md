@@ -1,6 +1,6 @@
 # GuardAgent 当前已实现功能说明
 
-> 文档日期：2026-07-22
+> 文档日期：2026-08-02
 > 当前版本：0.1.0（MVP）
 > 对应需求：`docs/OPENCLAW_GUARD_AGENT_REQUIREMENTS.md`
 
@@ -21,7 +21,7 @@ GuardAgent 是运行在 OpenClaw 旁路的本地安全控制系统，主要用�
 - 创建子智能体、后台任务和持久化任务；
 - 修改 OpenClaw、GuardAgent 或操作系统安全配置。
 
-系统采用“OpenClaw 原生安全控制 + GuardAgent 确定性策略”的分层防护模型。GuardAgent 不替代 OpenClaw 的 sandbox、tool policy、exec approvals、sender allowlist 和主机隔离，而是在这些原生控制之上增加统一事件、确定性判定、跨调用关联、审批与审计能力。
+系统采用“OpenClaw 原生安全控制 + GuardAgent 确定性策略 + 可选受限安全智能体”的分层防护模型。GuardAgent 不替代 OpenClaw 的 sandbox、tool policy、exec approvals、sender allowlist 和主机隔离。大模型只产生安全审查信号或任务策略提案，不能放宽基础策略，也没有工具执行权限。
 
 ## 3. 总体架构
 
@@ -37,6 +37,7 @@ GuardAgent 是运行在 OpenClaw 旁路的本地安全控制系统，主要用�
 | 测试样例 | `fixtures/` | allow、approve、deny 三类离线测试事件 |
 | 测试代码 | `tests/` | 单元、集成、对抗和性能测试 |
 | 运维脚本 | `scripts/` | 初始化、备份、基准测试和安装策略辅助脚本 |
+| LLM 与智能体运行时 | `guardd/llm/`、`guardd/agents/` | 结构化模型契约、上下文最小化、异步作业、验证、熔断和只收紧融合 |
 
 典型执行链路如下：
 
@@ -63,6 +64,10 @@ after_tool_call / 生命周期 Hook
         ▼
 SQLite 审计与关联状态更新
 ```
+
+启用 LLM 安全审查后，确定性结果先产生，再由异步 `SafetyReviewAgent` 对需要语义判断的事件复核。`shadow` 和 `advisory` 不改变执行结果；`enforce_tighten` 只能把 `ALLOW` 收紧为审批或拒绝，不能把确定性拒绝改为允许。首个 required-review 请求会阻断并要求完成后精确重试。
+
+第二阶段的 hybrid 任务策略不会让模型直接生成最终 `R_task`。系统仅把可信用户目标、别名化路径/域名和基础约束摘要发送给模型；模型返回带输入证据区间的 proposal，再由确定性编译器校验工具、别名、命令、父策略交集和预算。扩权仍须人工确认，失败时保留确定性候选策略。
 
 ## 4. 统一事件与决策模型
 

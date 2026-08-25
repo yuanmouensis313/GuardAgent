@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guardagent.local/schemas/llm-review.schema.json",
+  "title": "SafetyReviewResultV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "verdict", "risk", "confidence", "threats", "intent_alignment", "evidence", "recommended_action", "constraints", "summary"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "verdict": {"enum": ["ALLOW", "REQUIRE_APPROVAL", "DENY", "UNCERTAIN"]},
+    "risk": {"enum": ["info", "low", "medium", "high", "critical"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "threats": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"enum": ["prompt_injection", "secret_exfiltration", "scope_escape", "security_bypass", "destructive_action", "deception", "persistence", "privilege_escalation", "unrelated_action"]}
+    },
+    "intent_alignment": {"enum": ["aligned", "partially_aligned", "unrelated", "unknown"]},
+    "evidence": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "path", "claim"],
+        "properties": {
+          "source": {"type": "string", "minLength": 1, "maxLength": 64},
+          "path": {"type": "string", "pattern": "^\\$(?:\\.[A-Za-z_][A-Za-z0-9_]*|\\[\\d+\\])*$", "maxLength": 512},
+          "claim": {"type": "string", "minLength": 1, "maxLength": 512}
+        }
+      }
+    },
+    "recommended_action": {"enum": ["ALLOW", "REQUIRE_APPROVAL", "DENY", "UNCERTAIN"]},
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_paths": {"type": "array", "maxItems": 100, "items": {"type": "string"}},
+        "allowed_domains": {"type": "array", "maxItems": 100, "items": {"type": "string"}},
+        "allowed_tools": {"type": "array", "maxItems": 100, "items": {"type": "string"}},
+        "max_external_writes": {"type": ["integer", "null"], "minimum": 0, "maximum": 10000},
+        "max_files_changed": {"type": ["integer", "null"], "minimum": 0, "maximum": 100000}
+      }
+    },
+    "summary": {"type": "string", "minLength": 1, "maxLength": 1000}
+  }
+}

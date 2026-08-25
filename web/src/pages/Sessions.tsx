@@ -15,6 +15,8 @@ export default function Sessions() {
   });
   const detail = useQuery({ queryKey: ["session", selected], queryFn: () => api<any>(`/sessions/${encodeURIComponent(selected!)}`), enabled: !!selected });
   const taskPolicy = useQuery({ queryKey: ["task-policy", selected], queryFn: () => api<any>(`/sessions/${encodeURIComponent(selected!)}/task-policy`), enabled: !!selected });
+  const taskGenerations = useQuery({ queryKey: ["task-policy-generations", selected], queryFn: () => api<any>(`/task-policy-generations?session_key=${encodeURIComponent(selected!)}&limit=20`), enabled: !!selected, refetchInterval: 3000 });
+  const safetyMemory = useQuery({ queryKey: ["safety-memory", selected], queryFn: () => api<any>(`/sessions/${encodeURIComponent(selected!)}/safety-memory`), enabled: !!selected });
   const replay = useMutation({ mutationFn: () => api<any>(`/sessions/${encodeURIComponent(selected!)}/replay`, { method: "POST", body: postBody() }) });
   const activateTask = useMutation({
     mutationFn: (candidate: any) => api<any>(`/sessions/${encodeURIComponent(selected!)}/task-policy/activate`, {
@@ -27,6 +29,10 @@ export default function Sessions() {
       method: "POST", body: postBody({ candidate_digest: candidate.policy_digest }),
     }),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ["task-policy", selected] }); },
+  });
+  const retryGeneration = useMutation({
+    mutationFn: (generationId: string) => api<any>(`/task-policy-generations/${encodeURIComponent(generationId)}/retry`, { method: "POST", body: postBody() }),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ["task-policy-generations", selected] }); },
   });
   const rows = query.data?.pages.flatMap(page => page.items) || [];
   const selectSession = (sessionKey?: string) => {
@@ -92,6 +98,24 @@ export default function Sessions() {
             <details><summary>历史 revision 与确认记录</summary><JsonView value={{ history: view.history, confirmations: view.confirmations }} /></details>
           </div>;
         })()}
+        <h3>Hybrid R_task 生成</h3>
+        {taskGenerations.isLoading ? <Loading label="正在读取生成记录…" /> : taskGenerations.error ? <ErrorState error={taskGenerations.error} /> : taskGenerations.data?.items?.length ? <div className="detail-stack">
+          {taskGenerations.data.items.map((generation: any) => <Panel key={generation.generation_id} title={`Generation ${short(generation.generation_id, 12)}`} subtitle={`${formatTime(generation.created_at)} · revision ${generation.revision}`}>
+            <KeyValue items={[
+              ["状态", <Badge value={generation.status} />],
+              ["模型", generation.model || "deterministic fallback"],
+              ["草案摘要", <code>{short(generation.deterministic_draft_digest, 24)}</code>],
+              ["提案摘要", <code>{short(generation.proposal_digest, 24)}</code>],
+              ["编译策略", <code>{short(generation.compiled_policy_digest, 24)}</code>],
+              ["错误", generation.error_code || "—"],
+            ]} />
+            {generation.status === "failed" && <div className="inline-actions"><button className="button primary" disabled={retryGeneration.isPending} onClick={() => retryGeneration.mutate(generation.generation_id)}>重试生成</button></div>}
+            {(generation.accepted_fields?.length || generation.rejected_fields?.length || generation.uncertainties?.length) && <details><summary>编译明细</summary><JsonView value={{ accepted_fields: generation.accepted_fields, rejected_fields: generation.rejected_fields, uncertainties: generation.uncertainties }} /></details>}
+          </Panel>)}
+          {retryGeneration.error && <ErrorState error={retryGeneration.error} />}
+        </div> : <Empty title="此会话尚无 Hybrid 生成记录" />}
+        <h3>结构化安全记忆</h3>
+        {safetyMemory.isLoading ? <Loading label="正在构建安全记忆…" /> : safetyMemory.error ? <ErrorState error={safetyMemory.error} /> : <JsonView value={safetyMemory.data?.item || {}} />}
         <h3>时间线{item.timeline_truncated ? `（显示 ${item.timeline.length}/${item.timeline_total}）` : ""}</h3>
         {item.timeline?.length ? <div className="timeline">{item.timeline.map((entry: any, index: number) => <article key={entry.event?.event_id || index}><span className={`timeline-dot ${entry.risk || "info"}`} /><div><div><strong>{entry.event?.event_type}</strong><Badge value={entry.decision || "none"} />{entry.would_decide && <Badge value={entry.would_decide} />}<Badge value={entry.risk || "none"} /></div><small>{formatTime(entry.event?.occurred_at)} · {entry.event?.tool?.name || "lifecycle"}</small><p>{entry.reason || "无决策原因"}</p></div></article>)}</div> : <Empty />}
       </div>;

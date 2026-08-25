@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guardagent.local/schemas/task-policy-generation.schema.json",
+  "title": "TaskPolicyGenerationViewV1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["generation_id", "session_key", "status", "fingerprint", "input_digest", "draft_policy_digest"],
+  "properties": {
+    "generation_id": {"type": "string", "format": "uuid"},
+    "session_key": {"type": "string", "minLength": 1},
+    "status": {"enum": ["queued", "running", "completed", "failed", "timed_out", "invalid", "cancelled"]},
+    "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "input_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "draft_policy_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "proposal_digest": {"type": ["string", "null"]},
+    "compiled_policy_digest": {"type": ["string", "null"]},
+    "accepted_fields": {"type": "array", "items": {"type": "string"}},
+    "rejected_fields": {"type": "array", "items": {"type": "object"}},
+    "uncertainties": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -315,7 +315,10 @@ class UiApiTests(unittest.TestCase):
         settings = self.client.get("/v1/ui/settings")
         self.assertEqual(settings.status_code, 200)
         self.assertNotIn(self.token, settings.text)
+        override_token = ensure_token(self.settings.security_override_token_path)
+        self.assertNotIn(override_token, settings.text)
         self.assertNotIn("token_path", settings.text)
+        self.assertNotIn("api_key", settings.text)
         self.assertEqual(self.client.get("/v1/ui/events?cursor=invalid").status_code, 422)
 
     def test_ui_can_be_disabled_without_disabling_machine_api(self) -> None:

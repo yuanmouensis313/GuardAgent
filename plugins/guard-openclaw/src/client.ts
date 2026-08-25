@@ -160,6 +160,11 @@ export class GuardClient {
       this.capabilityError = "guardd capability contract does not require tool_result_persist";
       throw new Error(this.capabilityError);
     }
+    const llmReview = capabilities.llm_review as Record<string, unknown> | undefined;
+    if (llmReview?.enabled === true && llmReview.can_loosen_base_policy !== false) {
+      this.capabilityError = "guardd LLM review capability must declare can_loosen_base_policy=false";
+      throw new Error(this.capabilityError);
+    }
     this.capabilityError = undefined;
   }
 

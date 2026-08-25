@@ -101,7 +101,32 @@
         "prompt_digest": {"type": ["string", "null"]},
         "origin_channel": {"type": ["string", "null"]},
         "origin_sender_digest": {"type": ["string", "null"]},
-        "origin_is_local_operator": {"type": "boolean"}
+        "origin_is_local_operator": {"type": "boolean"},
+        "generation_id": {"type": ["string", "null"]},
+        "proposal_digest": {"type": ["string", "null"]},
+        "accepted_fields": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {"type": "string"}
+        },
+        "rejected_fields": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["field", "reason"],
+            "properties": {
+              "field": {"type": "string"},
+              "reason": {"type": "string"}
+            }
+          }
+        },
+        "uncertainties": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {"type": "string"}
+        }
       }
     },
     "created_at": {"type": "string", "format": "date-time"},

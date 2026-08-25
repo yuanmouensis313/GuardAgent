@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openclaw-guard-agent"
 version = "0.1.0"
-description = "Local deterministic guardrail service for OpenClaw"
+description = "Local policy-first guardrail and bounded safety-agent service for OpenClaw"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -22,9 +22,13 @@ dependencies = [
 test = ["pytest>=8.3,<9", "pytest-cov>=6,<8"]
 
 [project.scripts]
+guardagent = "guardd.launcher:main"
 guardd = "guardd.main:main"
 guardctl = "guardd.cli:app"
 guard-mcp-proxy = "guardd.mcp_proxy:main"
+
+[tool.uv]
+required-version = ">=0.11.24"
 
 [tool.setuptools.packages.find]
 include = ["guardd*"]
@@ -33,6 +37,7 @@ include = ["guardd*"]
 guardd = ["ui/static/**/*"]
 "guardd.policy" = ["policy.schema.json"]
 "guardd.sanitization" = ["patterns.json"]
+"guardd.llm" = ["prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

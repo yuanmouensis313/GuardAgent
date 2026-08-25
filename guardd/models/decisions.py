@@ -53,3 +53,9 @@ class Decision(BaseModel):
     task_policy_revision: int | None = None
     task_policy_verdict: str | None = None
     content_verdict_digest: str | None = None
+    base_decision: DecisionKind | None = None
+    review_id: UUID | None = None
+    review_status: str | None = None
+    review_verdict: str | None = None
+    review_digest: str | None = None
+    decision_sources: list[dict[str, str]] = Field(default_factory=list)

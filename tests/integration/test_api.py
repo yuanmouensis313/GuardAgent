@@ -12,6 +12,7 @@ from guardd.api import create_app
 from guardd.config import Settings
 from guardd.policy import PolicyLoader
 from guardd.security import ensure_token
+from uuid import uuid4
 
 
 ROOT = Path(__file__).parents[2]
@@ -59,6 +60,10 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(inspection["skill_authoritative_use_identity"])
         self.assertEqual(inspection["mcp_proxy_transports"], ["stdio"])
         self.assertEqual(inspection["mcp_unprotected_transports"], ["sse", "streamable_http"])
+        self.assertFalse(capabilities["llm_review"]["enabled"])
+        self.assertFalse(capabilities["llm_review"]["can_loosen_base_policy"])
+        self.assertTrue(capabilities["task_policy"]["deterministic_fallback"])
+        self.assertFalse(self.client.get("/v1/llm/health", headers=self.auth).json()["enabled"])
 
     def test_decision_and_approval_endpoints(self) -> None:
         response = self.client.post("/v1/decisions/tool", headers=self.auth, json=self.request("git push origin main"))
@@ -73,6 +78,11 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(resolution.status_code, 200)
         self.assertEqual(resolution.json()["status"], "allowed_once")
+        explicit_review = self.client.post(
+            f"/v1/events/{decision['event_id']}/review", headers=self.auth,
+            json={"schema_version": "1.0", "request_id": "review", "operator": "test"},
+        )
+        self.assertEqual(explicit_review.status_code, 409)
 
     def test_strict_content_type_and_schema(self) -> None:
         response = self.client.post("/v1/decisions/tool", headers=self.auth, content="{}")
@@ -84,6 +94,19 @@ class ApiTests(unittest.TestCase):
             content=b" " * (self.settings.request_limit_bytes + 1),
         )
         self.assertEqual(oversized.status_code, 413)
+
+    def test_security_override_requires_independent_credential(self) -> None:
+        response = self.client.post(
+            f"/v1/approvals/{uuid4()}/override-review-block",
+            headers=self.auth,
+            json={
+                "schema_version": "1.0", "request_id": "override-auth", "operator": "test",
+                "parameter_digest": f"sha256:{'a' * 64}",
+                "reason": "Testing independent credential enforcement",
+                "confirmation": "OVERRIDE_LLM_DENY",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
 
     def test_policy_validate_and_simulate(self) -> None:
         policy_text = self.settings.policy_path.read_text(encoding="utf-8")
