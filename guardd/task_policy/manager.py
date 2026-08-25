@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ class TaskPolicyManager:
             self.workspace, ensure_hmac_key(hmac_key_path), ttl_minutes,
         )
         self.hmac_key = self.synthesizer.hmac_key
+        self._hybrid_lock = threading.RLock()
 
     def update_base_policy_digest(self, digest: str) -> None:
         self.base_policy_digest = digest
@@ -288,6 +290,52 @@ class TaskPolicyManager:
         self.store.supersede_pending_task_policies(session_key)
         self.store.record_task_policy(candidate)
         return candidate
+
+    def accept_hybrid_candidate(self, policy: TaskPolicy, generation_id: str) -> TaskPolicy | None:
+        with self._hybrid_lock:
+            if policy.base_policy_digest != self.base_policy_digest:
+                return None
+            active = self.get(policy.session_key, TaskPolicyStatus.ACTIVE)
+            pending = self.store.get_pending_task_policy(policy.session_key)
+            if active and active.objective.source_digest != policy.objective.source_digest:
+                return None
+            if not active and pending and pending.objective.source_digest != policy.objective.source_digest:
+                return None
+            candidate = policy.model_copy(deep=True)
+            candidate.task_policy_id = uuid4()
+            candidate.revision = self.store.latest_task_policy_revision(policy.session_key) + 1
+            candidate.created_at = datetime.now(timezone.utc)
+            candidate.activated_at = None
+            candidate.closed_at = None
+            candidate.provenance.generation_id = generation_id
+            if candidate.parent_session_key:
+                parent = self.store.get_task_policy(
+                    candidate.parent_session_key,
+                    TaskPolicyStatus.ACTIVE.value,
+                )
+                if parent is None or parent.policy_digest != candidate.parent_policy_digest:
+                    return None
+                self._intersect_with_parent(candidate, parent)
+            candidate.status = (
+                TaskPolicyStatus.REVISION_CANDIDATE if active else TaskPolicyStatus.CANDIDATE
+            )
+            candidate.policy_digest = digest_payload(candidate.digest_payload())
+            if active and self._same_scope(candidate, active):
+                return active
+            self.store.supersede_pending_task_policies(candidate.session_key)
+            self.store.record_task_policy(candidate)
+            if active and self._is_narrower(candidate, active):
+                activated = self.store.activate_task_policy(
+                    session_key=candidate.session_key,
+                    candidate_digest=candidate.policy_digest,
+                    expected_active_revision=active.revision,
+                    operator="guardd:hybrid-auto-narrow",
+                    base_policy_digest=self.base_policy_digest,
+                )
+                if activated is None:
+                    raise TaskPolicyError("hybrid task-policy narrowing conflicted with a concurrent revision")
+                return activated
+            return candidate
 
     def close(self, session_key: str, operator: str) -> int:
         closed = self.store.close_task_policies(session_key, operator)

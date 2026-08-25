@@ -6,11 +6,13 @@ import threading
 import difflib
 import os
 import tempfile
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
+from guardd.agents import SafetyReviewAgent, TaskPolicyAgent
 from guardd.approvals import ApprovalManager
 from guardd.audit import AuditStore
 from guardd.config import Settings
@@ -19,23 +21,37 @@ from guardd.inspections import (
     InspectionConfirmationRequest, InspectionError, InspectionManager, McpDescriptorInspectionRequest,
     SkillInspectionRequest,
 )
+from guardd.llm import (
+    CompatibleHttpProvider,
+    DecisionFusionEngine,
+    LLMProvider,
+    PromptRegistry,
+    ReviewMode,
+    ReviewTrigger,
+    SafetyReviewContextBuilder,
+    SafetyReviewValidator,
+)
+from guardd.llm.jobs import ReviewTriggerPolicy
 from guardd.models.decisions import Decision, DecisionKind
 from guardd.models.events import GuardEvent, ToolResultEvent
 from guardd.policy import PolicyEngine, PolicyLoader, PolicyValidationError
 from guardd.security import SANITIZATION_PATTERN_DIGEST, digest_payload, ensure_hmac_key, sanitize
 from guardd.sanitization import SanitizationEventRequest
 from guardd.task_policy import TaskPolicyError, TaskPolicyManager, TaskPolicyStatus
+from guardd.task_policy.compiler import TaskPolicyCompiler, TaskPolicyProposalValidator
+from guardd.task_policy.hybrid_synthesizer import TrustedTaskContextBuilder
 
 
 class GuardService:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, llm_provider: LLMProvider | None = None):
         self.settings = settings
         self.loader = PolicyLoader()
         self.policy = self.loader.load(settings.policy_path)
         self.engine = PolicyEngine(self.policy, settings.workspace)
         self.store = AuditStore(settings.db_path, settings.emergency_log_path, self.engine.secret_patterns)
+        self.hmac_key = ensure_hmac_key(settings.hmac_key_path)
         self.inspections = InspectionManager(
-            self.store, ensure_hmac_key(settings.hmac_key_path), self.policy.digest,
+            self.store, self.hmac_key, self.policy.digest,
         )
         if settings.audit_retention_days > 0:
             retention = self.store.purge_before(
@@ -43,7 +59,12 @@ class GuardService:
             )
             if any(retention.values()):
                 self.store.record_operator_action("retention.purge", "startup", "audit", detail=retention)
-        self.approvals = ApprovalManager(self.store, settings.approval_ttl_seconds)
+        self.approvals = ApprovalManager(
+            self.store,
+            settings.approval_ttl_seconds,
+            review_mode=settings.llm_review_mode,
+            review_deny_confidence_threshold=settings.llm_review_deny_confidence_threshold,
+        )
         self.correlation = self._create_correlation(self.policy.document)
         self.task_policies = TaskPolicyManager(
             self.store,
@@ -54,6 +75,73 @@ class GuardService:
             ttl_minutes=settings.task_policy_ttl_minutes,
             out_of_scope=settings.task_policy_out_of_scope,
         ) if settings.task_policy_enabled else None
+        self.review_agent: SafetyReviewAgent | None = None
+        self.task_policy_agent: TaskPolicyAgent | None = None
+        self.llm_provider: LLMProvider | None = None
+        self.review_trigger = ReviewTriggerPolicy(settings.llm_review_sample_allow_rate)
+        self.review_fusion = DecisionFusionEngine(
+            deny_confidence_threshold=settings.llm_review_deny_confidence_threshold,
+            approval_confidence_threshold=settings.llm_review_approval_confidence_threshold,
+        )
+        self.review_context_builder = SafetyReviewContextBuilder(self.hmac_key)
+        if settings.llm_enabled:
+            api_key = os.getenv(settings.llm_api_key_env, "")
+            provider_host = urlsplit(settings.llm_base_url or "").hostname
+            if (
+                llm_provider is None
+                and not api_key
+                and provider_host not in {"127.0.0.1", "localhost", "::1"}
+            ):
+                raise ValueError(f"{settings.llm_api_key_env} is required for a remote LLM provider")
+            provider = llm_provider or CompatibleHttpProvider(
+                settings.llm_base_url or "",
+                api_key or "local-no-key",
+                connect_timeout_ms=settings.llm_connect_timeout_ms,
+                max_output_bytes=settings.llm_max_output_bytes,
+            )
+            self.llm_provider = provider
+        if self.llm_provider is not None and settings.llm_review_mode != "disabled":
+            self.review_agent = SafetyReviewAgent(
+                store=self.store,
+                provider=self.llm_provider,
+                model=settings.llm_model or "",
+                prompt=PromptRegistry().load("safety-review", "1"),
+                validator=SafetyReviewValidator(self.engine.secret_patterns),
+                base_policy_digest=self.policy.digest,
+                request_timeout_ms=settings.llm_request_timeout_ms,
+                max_input_bytes=settings.llm_max_input_bytes,
+                max_output_tokens=settings.llm_max_output_tokens,
+                max_concurrency=settings.llm_max_concurrency,
+                queue_capacity=settings.llm_queue_capacity,
+                cache_ttl_minutes=settings.llm_cache_ttl_minutes,
+                circuit_breaker_failures=settings.llm_circuit_breaker_failures,
+                circuit_breaker_cooldown_seconds=settings.llm_circuit_breaker_cooldown_seconds,
+                review_mode=settings.llm_review_mode,
+                deny_confidence_threshold=settings.llm_review_deny_confidence_threshold,
+            )
+            self.review_agent.start()
+        if (
+            self.llm_provider is not None
+            and settings.task_policy_synthesizer == "hybrid"
+            and self.task_policies is not None
+        ):
+            self.task_policy_agent = TaskPolicyAgent(
+                store=self.store,
+                provider=self.llm_provider,
+                model=settings.llm_model or "",
+                prompt=PromptRegistry().load("task-policy", "1"),
+                validator=TaskPolicyProposalValidator(self.engine.secret_patterns),
+                compiler=TaskPolicyCompiler(),
+                on_compiled=self._accept_hybrid_policy,
+                request_timeout_ms=settings.task_policy_model_timeout_ms,
+                max_input_bytes=settings.llm_max_input_bytes,
+                max_output_tokens=max(settings.llm_max_output_tokens, 2000),
+                max_concurrency=1,
+                queue_capacity=max(1, settings.llm_queue_capacity // 2),
+                circuit_breaker_failures=settings.llm_circuit_breaker_failures,
+                circuit_breaker_cooldown_seconds=settings.llm_circuit_breaker_cooldown_seconds,
+            )
+            self.task_policy_agent.start()
         self._event_sink: Callable[[str, dict[str, Any]], None] | None = None
         self._events: dict[UUID, GuardEvent] = {}
         self._policy_lock = threading.RLock()
@@ -122,6 +210,7 @@ class GuardService:
                 remediation="Review the raw action locally and approve once only if its exact target is understood",
             )
             self.store.incident("high", "normalization_error", str(exc), {"event_id": str(event.event_id)})
+        self._apply_llm_review(event, decision)
         self._events[event.event_id] = event
         if len(self._events) > 5000:
             self._events.pop(next(iter(self._events)))
@@ -141,6 +230,135 @@ class GuardService:
             self._emit("approval.created", {"approval_id": str(decision.approval_id), "expires_at": decision.expires_at})
         return decision
 
+    def _apply_llm_review(self, event: GuardEvent, decision: Decision) -> None:
+        mode = ReviewMode(self.settings.llm_review_mode)
+        if mode == ReviewMode.DISABLED or self.review_agent is None:
+            return
+        decision.base_decision = decision.decision
+        decision.decision_sources.append({
+            "source": "deterministic",
+            "digest": self.policy.digest,
+            "decision": decision.decision.value,
+        })
+        trigger = self.review_trigger.evaluate(decision, decision.parameter_digest)
+        if trigger == ReviewTrigger.SKIP:
+            decision.review_status = "skipped"
+            return
+        try:
+            active_policy = (
+                self.task_policies.get(event.session_key, TaskPolicyStatus.ACTIVE)
+                if self.task_policies else None
+            )
+            objective_summary = active_policy.objective.summary if active_policy else None
+            memory = self.correlation.safety_memory(
+                event.session_key,
+                self.hmac_key,
+                active_task_policy_digest=decision.task_policy_digest,
+            )
+            input_document = self.review_context_builder.build(
+                event,
+                decision,
+                memory,
+                objective_summary=objective_summary,
+            )
+            cached = self.review_agent.get_cached(input_document)
+            if cached is not None:
+                decision.review_id = UUID(cached["review_id"])
+                decision.review_status = "completed"
+                decision.review_verdict = cached["verdict"]
+                decision.review_digest = cached["result_digest"]
+                decision.decision_sources.append({
+                    "source": "llm_review",
+                    "digest": cached["result_digest"],
+                    "decision": cached["verdict"],
+                })
+                override = self.store.get_active_llm_review_override(
+                    cached["review_id"],
+                    decision.parameter_digest,
+                )
+                if override is not None and mode == ReviewMode.ENFORCE_TIGHTEN:
+                    self._tighten_for_review_override(decision, cached, override)
+                else:
+                    self.review_fusion.fuse(decision, trigger, cached, mode)
+                return
+            reference = self.review_agent.enqueue(
+                input_document,
+                subject_id=str(event.event_id),
+                priority={"info": 0, "low": 10, "medium": 30, "high": 70, "critical": 100}.get(decision.risk, 30),
+            )
+            if reference is None:
+                decision.review_status = "queue_full"
+                if mode == ReviewMode.ENFORCE_TIGHTEN and trigger == ReviewTrigger.REVIEW_REQUIRED:
+                    self._tighten_for_pending_review(decision, "LLM review queue is full")
+                return
+            decision.review_id = reference.review_id
+            decision.review_status = reference.status.value
+            if (
+                mode == ReviewMode.ENFORCE_TIGHTEN
+                and trigger == ReviewTrigger.REVIEW_REQUIRED
+                and decision.decision != DecisionKind.OBSERVE
+            ):
+                self._tighten_for_pending_review(decision, "Required semantic review is pending")
+        except Exception as exc:
+            decision.review_status = "degraded"
+            self.store.incident(
+                "high",
+                "llm_review_enqueue",
+                "LLM review could not be scheduled",
+                {"event_id": str(event.event_id), "error_type": type(exc).__name__},
+            )
+            if (
+                mode == ReviewMode.ENFORCE_TIGHTEN
+                and trigger == ReviewTrigger.REVIEW_REQUIRED
+                and decision.decision != DecisionKind.OBSERVE
+            ):
+                self._tighten_for_pending_review(decision, "Required semantic review is unavailable")
+
+    @staticmethod
+    def _tighten_for_pending_review(decision: Decision, reason: str) -> None:
+        if decision.decision == DecisionKind.DENY:
+            return
+        if decision.decision != DecisionKind.REQUIRE_APPROVAL:
+            decision.decision = DecisionKind.REQUIRE_APPROVAL
+        if "LLM-REVIEW-PENDING-001" not in decision.rule_ids:
+            decision.rule_ids.append("LLM-REVIEW-PENDING-001")
+        decision.risk = "high" if decision.risk in {"info", "low", "medium"} else decision.risk
+        decision.reason = f"{decision.reason}; {reason}"
+        decision.remediation = "Wait for semantic review to complete, then retry the exact bound action"
+
+    @staticmethod
+    def _tighten_for_review_override(
+        decision: Decision,
+        review: dict[str, Any],
+        override: dict[str, Any],
+    ) -> None:
+        proposed = decision.would_decide or decision.decision
+        if proposed == DecisionKind.DENY:
+            return
+        if decision.decision == DecisionKind.OBSERVE:
+            decision.would_decide = DecisionKind.REQUIRE_APPROVAL
+        else:
+            decision.decision = DecisionKind.REQUIRE_APPROVAL
+        if "LLM-REVIEW-OVERRIDE-APPROVAL-001" not in decision.rule_ids:
+            decision.rule_ids.append("LLM-REVIEW-OVERRIDE-APPROVAL-001")
+        decision.risk = "high" if decision.risk in {"info", "low", "medium"} else decision.risk
+        decision.reason = (
+            f"{decision.reason}; semantic deny {review['review_id']} was locally overridden "
+            f"for this exact parameter digest; one-time operator approval remains required"
+        )
+        decision.remediation = (
+            "Independently verify the locally audited override and approve only this exact action once"
+        )
+        decision.decision_sources.append({
+            "source": "local_security_override",
+            "digest": digest_payload({
+                "override_id": override["override_id"],
+                "review_id": override["review_id"],
+                "parameter_digest": override["parameter_digest"],
+            }),
+            "decision": "REQUIRE_APPROVAL",
+        })
+
     def resolve_approval(self, approval_id: UUID, allow: bool, operator: str) -> dict[str, Any]:
         result = self.approvals.resolve(approval_id, allow, operator)
         if not allow:
@@ -152,6 +370,100 @@ class GuardService:
             {"event_id": result["event_id"], "status": result["status"], "parameter_digest": result["parameter_digest"]},
         )
         self._emit("approval.resolved", {"approval_id": str(approval_id), "status": result["status"]})
+        return result
+
+    def override_review_block(
+        self,
+        approval_id: UUID,
+        *,
+        parameter_digest: str,
+        operator: str,
+        reason: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        if confirmation != "OVERRIDE_LLM_DENY":
+            raise ValueError("security override requires confirmation OVERRIDE_LLM_DENY")
+        result = self.approvals.override_review_block(
+            approval_id,
+            parameter_digest=parameter_digest,
+            operator=operator,
+            reason=reason,
+        )
+        self.store.record_operator_action(
+            "approval.review_override",
+            operator,
+            "approval",
+            str(approval_id),
+            {
+                "event_id": result["event_id"],
+                "blocking_review_id": result["blocking_review_id"],
+                "parameter_digest": result["parameter_digest"],
+                "reason": result["override_reason"],
+            },
+        )
+        self._emit("approval.review_override", {"approval_id": str(approval_id)})
+        return result
+
+    def request_event_review(self, event_id: UUID, operator: str) -> dict[str, Any]:
+        if self.review_agent is None:
+            raise ValueError("LLM review is disabled")
+        detail = self.store.get_event_detail(str(event_id))
+        if detail is None or not detail.get("decision_id"):
+            raise ValueError("event decision not found")
+        try:
+            event = GuardEvent.model_validate(detail["event"])
+            decision = Decision(
+                decision_id=UUID(detail["decision_id"]),
+                event_id=event_id,
+                decision=DecisionKind(detail["decision"]),
+                would_decide=DecisionKind(detail["would_decide"]) if detail.get("would_decide") else None,
+                risk=detail["risk"],
+                rule_ids=detail.get("rule_ids", []),
+                reason=detail["reason"],
+                effective_mode=detail["mode"],
+                parameter_digest=detail["parameter_digest"],
+                sanitized_params=event.params,
+                task_policy_digest=detail.get("task_policy_digest"),
+                task_policy_revision=detail.get("task_policy_revision"),
+                task_policy_verdict=detail.get("task_policy_verdict"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("stored event decision cannot be reviewed") from exc
+        active_policy = (
+            self.task_policies.get(event.session_key, TaskPolicyStatus.ACTIVE)
+            if self.task_policies else None
+        )
+        memory = self.correlation.safety_memory(
+            event.session_key,
+            self.hmac_key,
+            active_task_policy_digest=decision.task_policy_digest,
+        )
+        input_document = self.review_context_builder.build(
+            event,
+            decision,
+            memory,
+            objective_summary=active_policy.objective.summary if active_policy else None,
+        )
+        cached = self.review_agent.get_cached(input_document)
+        if cached is not None:
+            result = {"review_id": cached["review_id"], "status": "completed", "cache_hit": True}
+        else:
+            reference = self.review_agent.enqueue(
+                input_document,
+                subject_id=str(event_id),
+                priority=100,
+            )
+            if reference is None:
+                raise ValueError("LLM review queue is full")
+            result = reference.model_dump(mode="json")
+        self.store.record_operator_action(
+            "llm_review.request",
+            operator,
+            "event",
+            str(event_id),
+            {"review_id": str(result["review_id"]), "cache_hit": bool(result.get("cache_hit"))},
+        )
+        self._emit("llm_review.queued", {"event_id": str(event_id), "review_id": str(result["review_id"])})
         return result
 
     def _inspection_matches(self, event: GuardEvent) -> list[dict[str, Any]]:
@@ -423,6 +735,11 @@ class GuardService:
         self.correlation = self._create_correlation(candidate.document)
         if self.task_policies:
             self.task_policies.update_base_policy_digest(candidate.digest)
+        if self.review_agent:
+            self.review_agent.update_base_policy_digest(candidate.digest)
+            self.review_agent.validator.secret_patterns = self.engine.secret_patterns
+        if self.task_policy_agent:
+            self.task_policy_agent.validator.secret_patterns = self.engine.secret_patterns
         self.inspections.update_policy_digest(candidate.digest)
         self._restore_recent_state()
 
@@ -504,6 +821,8 @@ class GuardService:
                 "enabled": self.task_policies is not None,
                 "mode": self.settings.task_policy_mode,
                 "out_of_scope": self.settings.task_policy_out_of_scope,
+                "synthesizer": self.settings.task_policy_synthesizer,
+                "generation_health": self.task_policy_agent.health() if self.task_policy_agent else None,
             },
             "sanitization": {
                 "enabled": self.settings.sanitization_enabled,
@@ -514,6 +833,11 @@ class GuardService:
                 "enabled": self.settings.content_inspection_enabled,
                 "mode": self.settings.content_inspection_mode,
             },
+            "llm_review": {
+                "enabled": self.review_agent is not None,
+                "mode": self.settings.llm_review_mode,
+                "health": self.review_agent.health() if self.review_agent else None,
+            },
             **self.store.status_counts(),
         }
 
@@ -521,7 +845,13 @@ class GuardService:
         return {
             "schema_version": "1.0",
             "event_schema_versions": ["1.0", "1.1"],
-            "task_policy": {"enabled": self.task_policies is not None, "api_version": "1.0"},
+            "task_policy": {
+                "enabled": self.task_policies is not None,
+                "api_version": "1.0",
+                "synthesizer": self.settings.task_policy_synthesizer,
+                "hybrid_generation": self.task_policy_agent is not None,
+                "deterministic_fallback": True,
+            },
             "sanitization": {
                 "enabled": self.settings.sanitization_enabled,
                 "mode": self.settings.sanitization_mode,
@@ -543,7 +873,52 @@ class GuardService:
                 "mcp_proxy_transports": ["stdio"],
                 "mcp_unprotected_transports": ["sse", "streamable_http"],
             },
+            "llm_review": {
+                "enabled": self.review_agent is not None,
+                "mode": self.settings.llm_review_mode,
+                "schema_version": "1.0",
+                "subjects": ["tool_call", "message_send"],
+                "async": True,
+                "can_loosen_base_policy": False,
+            },
         }
+
+    def list_llm_reviews(
+        self,
+        status: str | None = None,
+        session_key: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_llm_reviews(
+            status=status,
+            session_key=session_key,
+            limit=min(max(limit, 1), 500),
+        )
+
+    def get_llm_review(self, review_id: UUID) -> dict[str, Any]:
+        item = self.store.get_llm_review(str(review_id))
+        if item is None:
+            raise ValueError("LLM review not found")
+        return item
+
+    def retry_llm_review(self, review_id: UUID, operator: str) -> dict[str, Any]:
+        item = self.store.retry_llm_review(str(review_id))
+        if item is None:
+            raise ValueError("LLM review not found")
+        self.store.record_operator_action(
+            "llm_review.retry", operator, "llm_review", str(review_id),
+            {"status": item.get("status")},
+        )
+        self._emit("llm_review.queued", {"review_id": str(review_id)})
+        return item
+
+    def llm_health(self) -> dict[str, Any]:
+        if self.review_agent is None:
+            return {"enabled": False, "mode": self.settings.llm_review_mode}
+        return {"mode": self.settings.llm_review_mode, **self.review_agent.health()}
+
+    def llm_metrics(self) -> dict[str, Any]:
+        return self.store.llm_review_metrics()
 
     def capture_task_policy(
         self, prompt: str, session_key: str, agent_id: str,
@@ -556,6 +931,32 @@ class GuardService:
             parent_session_key=parent_session_key,
             origin=origin,
         )
+        if (
+            self.task_policy_agent is not None
+            and policy.status in {TaskPolicyStatus.CANDIDATE, TaskPolicyStatus.REVISION_CANDIDATE}
+            and policy.provenance.generator == "deterministic"
+        ):
+            active = self.task_policies.get(session_key, TaskPolicyStatus.ACTIVE)
+            context = TrustedTaskContextBuilder().build(
+                prompt=prompt,
+                draft=policy,
+                origin=origin,
+                active_task_summary=active.objective.summary if active else None,
+            )
+            generation = self.task_policy_agent.enqueue(context, policy)
+            if generation is None:
+                self.store.incident(
+                    "high",
+                    "task_policy_generation_queue",
+                    "Hybrid task-policy generation queue is full; deterministic candidate retained",
+                    {"session_key": session_key, "revision": policy.revision},
+                )
+            else:
+                self._emit("task_policy.generation_queued", {
+                    "generation_id": generation["generation_id"],
+                    "session_key": session_key,
+                    "revision": policy.revision,
+                })
         self.store.record_operator_action(
             "task_policy.capture", "openclaw", "task_policy", str(policy.task_policy_id),
             {"session_key": session_key, "revision": policy.revision, "digest": policy.policy_digest, "status": policy.status.value},
@@ -566,6 +967,60 @@ class GuardService:
             "revision": policy.revision, "digest": policy.policy_digest, "status": policy.status.value,
         })
         return policy
+
+    def _accept_hybrid_policy(self, policy: Any, generation_id: str) -> Any:
+        if self.task_policies is None:
+            return None
+        accepted = self.task_policies.accept_hybrid_candidate(policy, generation_id)
+        if accepted is not None:
+            self._emit("task_policy.hybrid_candidate", {
+                "generation_id": generation_id,
+                "task_policy_id": str(accepted.task_policy_id),
+                "session_key": accepted.session_key,
+                "revision": accepted.revision,
+                "status": accepted.status.value,
+                "digest": accepted.policy_digest,
+            })
+        return accepted
+
+    def get_task_policy_generation(self, generation_id: UUID) -> dict[str, Any]:
+        item = self.store.get_task_policy_generation(str(generation_id))
+        if item is None:
+            raise TaskPolicyError("task policy generation not found")
+        return item
+
+    def list_task_policy_generations(
+        self,
+        session_key: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_task_policy_generations(
+            session_key=session_key,
+            status=status,
+            limit=min(max(limit, 1), 500),
+        )
+
+    def retry_task_policy_generation(self, generation_id: UUID, operator: str) -> dict[str, Any]:
+        item = self.store.retry_task_policy_generation(str(generation_id))
+        if item is None:
+            raise TaskPolicyError("task policy generation not found")
+        self.store.record_operator_action(
+            "task_policy_generation.retry", operator, "task_policy_generation", str(generation_id),
+            {"status": item.get("status")},
+        )
+        return item
+
+    def safety_memory(self, session_key: str) -> dict[str, Any]:
+        active = (
+            self.task_policies.get(session_key, TaskPolicyStatus.ACTIVE)
+            if self.task_policies else None
+        )
+        return self.correlation.safety_memory(
+            session_key,
+            self.hmac_key,
+            active_task_policy_digest=active.policy_digest if active else None,
+        ).model_dump(mode="json")
 
     def get_task_policy(self, session_key: str, status: str | None = None) -> Any:
         if self.task_policies is None:
@@ -645,4 +1100,8 @@ class GuardService:
         return {"session_key": session_key, "closed": closed}
 
     def close(self) -> None:
+        if self.task_policy_agent:
+            self.task_policy_agent.close()
+        if self.review_agent:
+            self.review_agent.close()
         self.store.close()

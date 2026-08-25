@@ -7,7 +7,7 @@ import re
 import base64
 import shutil
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID
@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS decisions (
   would_decide TEXT, risk TEXT NOT NULL, reason TEXT NOT NULL, parameter_digest TEXT NOT NULL,
   mode TEXT NOT NULL, policy_digest TEXT NOT NULL, created_at TEXT NOT NULL,
   task_policy_digest TEXT, task_policy_revision INTEGER, task_policy_verdict TEXT,
-  content_verdict_digest TEXT, transformation_digest TEXT
+  content_verdict_digest TEXT, transformation_digest TEXT,
+  base_decision TEXT, review_id TEXT, review_status TEXT,
+  review_verdict TEXT, review_digest TEXT, decision_sources_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_event ON decisions(event_id);
 CREATE TABLE IF NOT EXISTS rule_matches (
@@ -41,7 +43,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   approval_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL, event_id TEXT NOT NULL,
   agent_id TEXT NOT NULL, session_key TEXT NOT NULL, sender_id TEXT,
   parameter_digest TEXT NOT NULL, status TEXT NOT NULL, expires_at TEXT NOT NULL,
-  resolved_at TEXT, operator TEXT, resolution_ms REAL, display_json TEXT NOT NULL
+  resolved_at TEXT, operator TEXT, resolution_ms REAL, display_json TEXT NOT NULL,
+  resolution_gate TEXT, blocking_review_id TEXT, blocked_reason_code TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, expires_at);
 CREATE TABLE IF NOT EXISTS tool_results (
@@ -123,6 +126,64 @@ CREATE TABLE IF NOT EXISTS content_confirmations (
   decision TEXT NOT NULL, scope TEXT NOT NULL, session_key TEXT, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_content_confirmations_verdict ON content_confirmations(verdict_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS llm_review_jobs (
+  review_id TEXT PRIMARY KEY, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL,
+  session_key TEXT, fingerprint TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+  priority INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT, lease_owner TEXT, lease_expires_at TEXT,
+  input_digest TEXT NOT NULL, sanitized_input_json TEXT NOT NULL,
+  base_policy_digest TEXT NOT NULL, task_policy_digest TEXT,
+  prompt_template_digest TEXT NOT NULL, model_config_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, last_error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_review_jobs_status
+  ON llm_review_jobs(status, priority DESC, next_attempt_at, created_at);
+CREATE TABLE IF NOT EXISTS llm_reviews (
+  review_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL UNIQUE,
+  input_digest TEXT NOT NULL, result_digest TEXT NOT NULL,
+  schema_version TEXT NOT NULL, verdict TEXT NOT NULL, risk TEXT NOT NULL,
+  confidence REAL NOT NULL, threats_json TEXT NOT NULL, intent_alignment TEXT NOT NULL,
+  recommended_action TEXT NOT NULL, evidence_json TEXT NOT NULL,
+  constraints_json TEXT NOT NULL, sanitized_summary TEXT NOT NULL,
+  provider TEXT NOT NULL, model TEXT NOT NULL, model_config_digest TEXT NOT NULL,
+  prompt_template_id TEXT NOT NULL, prompt_template_digest TEXT NOT NULL,
+  base_policy_digest TEXT NOT NULL, task_policy_digest TEXT,
+  token_input INTEGER, token_output INTEGER, latency_ms INTEGER NOT NULL,
+  finish_reason TEXT, validation_issues_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  FOREIGN KEY(review_id) REFERENCES llm_review_jobs(review_id)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_reviews_expiry ON llm_reviews(expires_at);
+CREATE TABLE IF NOT EXISTS llm_review_overrides (
+  override_id TEXT PRIMARY KEY, review_id TEXT NOT NULL, approval_id TEXT NOT NULL,
+  parameter_digest TEXT NOT NULL, operator TEXT NOT NULL, reason TEXT NOT NULL,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  FOREIGN KEY(review_id) REFERENCES llm_review_jobs(review_id)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_review_overrides_binding
+  ON llm_review_overrides(review_id, parameter_digest, expires_at);
+CREATE TABLE IF NOT EXISTS task_policy_generation_jobs (
+  generation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+  draft_policy_id TEXT NOT NULL, revision INTEGER NOT NULL,
+  trusted_context_digest TEXT NOT NULL, deterministic_draft_digest TEXT NOT NULL,
+  status TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE,
+  priority INTEGER NOT NULL DEFAULT 0, attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT, lease_owner TEXT, lease_expires_at TEXT,
+  sanitized_context_json TEXT NOT NULL, created_at TEXT NOT NULL,
+  started_at TEXT, completed_at TEXT, error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_generation_status
+  ON task_policy_generation_jobs(status, priority DESC, next_attempt_at, created_at);
+CREATE TABLE IF NOT EXISTS task_policy_proposals (
+  generation_id TEXT PRIMARY KEY, proposal_digest TEXT NOT NULL,
+  sanitized_proposal_json TEXT NOT NULL, compiled_policy_digest TEXT,
+  accepted_fields_json TEXT NOT NULL, rejected_fields_json TEXT NOT NULL,
+  uncertainties_json TEXT NOT NULL, provider TEXT, model TEXT,
+  prompt_template_digest TEXT, model_config_digest TEXT,
+  token_input INTEGER, token_output INTEGER, latency_ms INTEGER,
+  finish_reason TEXT, created_at TEXT NOT NULL,
+  FOREIGN KEY(generation_id) REFERENCES task_policy_generation_jobs(generation_id)
+);
 CREATE INDEX IF NOT EXISTS idx_events_occurred_event ON events(occurred_at DESC, event_id DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_risk_created ON decisions(risk, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_kind_created ON decisions(decision, created_at DESC);
@@ -153,6 +214,21 @@ class AuditStore:
             self._ensure_column("decisions", "task_policy_verdict", "TEXT")
             self._ensure_column("decisions", "content_verdict_digest", "TEXT")
             self._ensure_column("decisions", "transformation_digest", "TEXT")
+            self._ensure_column("decisions", "base_decision", "TEXT")
+            self._ensure_column("decisions", "review_id", "TEXT")
+            self._ensure_column("decisions", "review_status", "TEXT")
+            self._ensure_column("decisions", "review_verdict", "TEXT")
+            self._ensure_column("decisions", "review_digest", "TEXT")
+            self._ensure_column("decisions", "decision_sources_json", "TEXT")
+            self._ensure_column("approvals", "resolution_gate", "TEXT")
+            self._ensure_column("approvals", "blocking_review_id", "TEXT")
+            self._ensure_column("approvals", "blocked_reason_code", "TEXT")
+            self._ensure_column("llm_review_jobs", "base_policy_digest", "TEXT")
+            self._ensure_column("llm_review_jobs", "task_policy_digest", "TEXT")
+            self._ensure_column("llm_review_jobs", "prompt_template_digest", "TEXT")
+            self._ensure_column("llm_review_jobs", "model_config_digest", "TEXT")
+            self._ensure_column("llm_reviews", "intent_alignment", "TEXT")
+            self._ensure_column("llm_reviews", "recommended_action", "TEXT")
             self._connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
                 (self._now(),),
@@ -173,6 +249,18 @@ class AuditStore:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)",
                 (self._now(),),
             )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, ?)",
+                (self._now(),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (7, ?)",
+                (self._now(),),
+            )
+            self._connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (8, ?)",
+                (self._now(),),
+            )
             self._connection.commit()
             try:
                 self.path.chmod(0o600)
@@ -180,7 +268,13 @@ class AuditStore:
                 pass
         except sqlite3.Error:
             self._connection.close()
-            backup = self.path.with_name(f"{self.path.name}.pre-schema-v5.bak")
+            backup = self.path.with_name(f"{self.path.name}.pre-schema-v8.bak")
+            if not backup.is_file():
+                backup = self.path.with_name(f"{self.path.name}.pre-schema-v7.bak")
+            if not backup.is_file():
+                backup = self.path.with_name(f"{self.path.name}.pre-schema-v6.bak")
+            if not backup.is_file():
+                backup = self.path.with_name(f"{self.path.name}.pre-schema-v5.bak")
             if not backup.is_file():
                 backup = self.path.with_name(f"{self.path.name}.pre-ui-v1.bak")
             if backup.is_file():
@@ -206,7 +300,7 @@ class AuditStore:
     def _backup_before_schema_migration(self) -> None:
         if not self.path.is_file():
             return
-        backup = self.path.with_name(f"{self.path.name}.pre-schema-v5.bak")
+        backup = self.path.with_name(f"{self.path.name}.pre-schema-v8.bak")
         if backup.exists():
             return
         shutil.copy2(self.path, backup)
@@ -275,13 +369,18 @@ class AuditStore:
                 self._connection.execute(
                     "INSERT OR REPLACE INTO decisions("
                     "decision_id, event_id, decision, would_decide, risk, reason, parameter_digest, mode, policy_digest, created_at, "
-                    "task_policy_digest, task_policy_revision, task_policy_verdict, content_verdict_digest, transformation_digest"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "task_policy_digest, task_policy_revision, task_policy_verdict, content_verdict_digest, transformation_digest, "
+                    "base_decision, review_id, review_status, review_verdict, review_digest, decision_sources_json"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (str(decision.decision_id), str(decision.event_id), decision.decision.value,
                      decision.would_decide.value if decision.would_decide else None, decision.risk,
                      decision.reason, decision.parameter_digest, decision.effective_mode, policy_digest, self._now(),
                      decision.task_policy_digest, decision.task_policy_revision, decision.task_policy_verdict,
-                     decision.content_verdict_digest, decision.transformation_digest),
+                     decision.content_verdict_digest, decision.transformation_digest,
+                     decision.base_decision.value if decision.base_decision else None,
+                     str(decision.review_id) if decision.review_id else None,
+                     decision.review_status, decision.review_verdict, decision.review_digest,
+                     json.dumps(decision.decision_sources, ensure_ascii=False, default=str)),
                 )
                 self._connection.executemany(
                     "INSERT OR IGNORE INTO rule_matches VALUES (?, ?)",
@@ -553,6 +652,14 @@ class AuditStore:
         sql += " ORDER BY revision DESC LIMIT 1"
         with self._lock:
             row = self._connection.execute(sql, args).fetchone()
+        return self._task_policy_from_row(row)
+
+    def get_task_policy_by_id(self, task_policy_id: str) -> Any:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM task_policies WHERE task_policy_id=?",
+                (task_policy_id,),
+            ).fetchone()
         return self._task_policy_from_row(row)
 
     def get_pending_task_policy(self, session_key: str) -> Any:
@@ -882,7 +989,8 @@ class AuditStore:
         with self._lock:
             row = self._connection.execute(
                 "SELECT e.*, d.decision_id, d.decision, d.would_decide, d.risk, d.reason, "
-                "d.parameter_digest, d.mode, d.policy_digest, d.created_at AS decision_created_at "
+                "d.parameter_digest, d.mode, d.policy_digest, d.created_at AS decision_created_at, "
+                "d.task_policy_digest, d.task_policy_revision, d.task_policy_verdict "
                 "FROM events e LEFT JOIN decisions d ON d.event_id=e.event_id WHERE e.event_id=?",
                 (event_id,),
             ).fetchone()
@@ -1181,6 +1289,579 @@ class AuditStore:
             row["result"] = self._json(row.pop("result_json"), None)
         return rows
 
+    def enqueue_llm_review(
+        self,
+        *,
+        review_id: str,
+        subject_type: str,
+        subject_id: str,
+        session_key: str | None,
+        fingerprint: str,
+        priority: int,
+        input_digest: str,
+        input_document: dict[str, Any],
+        base_policy_digest: str,
+        task_policy_digest: str | None,
+        prompt_template_digest: str,
+        model_config_digest: str,
+        queue_capacity: int,
+    ) -> dict[str, Any] | None:
+        clean, _ = sanitize(input_document, extra_patterns=self.secret_patterns)
+        serialized = json.dumps(clean, ensure_ascii=False, separators=(",", ":"), default=str)
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT * FROM llm_review_jobs WHERE fingerprint=?",
+                (fingerprint,),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            queued = self._connection.execute(
+                "SELECT COUNT(*) FROM llm_review_jobs WHERE status IN ('queued', 'running')",
+            ).fetchone()[0]
+            if int(queued) >= max(1, queue_capacity):
+                return None
+            self._connection.execute(
+                "INSERT INTO llm_review_jobs("
+                "review_id, subject_type, subject_id, session_key, fingerprint, status, priority, "
+                "attempt_count, next_attempt_at, lease_owner, lease_expires_at, input_digest, "
+                "sanitized_input_json, base_policy_digest, task_policy_digest, prompt_template_digest, "
+                "model_config_digest, created_at, started_at, completed_at, last_error_code"
+                ") VALUES (?, ?, ?, ?, ?, 'queued', ?, 0, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                (
+                    review_id, subject_type, subject_id, session_key, fingerprint, int(priority),
+                    input_digest, serialized, base_policy_digest, task_policy_digest,
+                    prompt_template_digest, model_config_digest, self._now(),
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM llm_review_jobs WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def claim_llm_review(self, worker_id: str, lease_seconds: int = 30) -> dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        lease_expires = (now + timedelta(seconds=max(5, lease_seconds))).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE llm_review_jobs SET status='queued', lease_owner=NULL, lease_expires_at=NULL, "
+                "last_error_code='LLM_WORKER_LEASE_EXPIRED' "
+                "WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+                (now_text,),
+            )
+            row = self._connection.execute(
+                "SELECT review_id FROM llm_review_jobs "
+                "WHERE status='queued' AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+                "ORDER BY priority DESC, created_at ASC LIMIT 1",
+                (now_text,),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = self._connection.execute(
+                "UPDATE llm_review_jobs SET status='running', lease_owner=?, lease_expires_at=?, "
+                "attempt_count=attempt_count+1, started_at=COALESCE(started_at, ?) "
+                "WHERE review_id=? AND status='queued'",
+                (worker_id, lease_expires, now_text, row["review_id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = self._connection.execute(
+                "SELECT * FROM llm_review_jobs WHERE review_id=?",
+                (row["review_id"],),
+            ).fetchone()
+        if claimed is None:
+            return None
+        result = dict(claimed)
+        result["input_document"] = self._json(result.pop("sanitized_input_json"), {})
+        return result
+
+    def record_llm_review(
+        self,
+        *,
+        review_id: str,
+        fingerprint: str,
+        input_digest: str,
+        result_digest: str,
+        schema_version: str,
+        verdict: str,
+        risk: str,
+        confidence: float,
+        threats: list[str],
+        intent_alignment: str,
+        recommended_action: str,
+        evidence: list[dict[str, Any]],
+        constraints: dict[str, Any],
+        sanitized_summary: str,
+        provider: str,
+        model: str,
+        model_config_digest: str,
+        prompt_template_id: str,
+        prompt_template_digest: str,
+        base_policy_digest: str,
+        task_policy_digest: str | None,
+        token_input: int | None,
+        token_output: int | None,
+        latency_ms: int,
+        finish_reason: str | None,
+        validation_issues: list[str],
+        expires_at: str,
+        block_approval: bool = False,
+    ) -> None:
+        clean_summary, _ = sanitize(sanitized_summary, extra_patterns=self.secret_patterns)
+        clean_evidence, _ = sanitize(evidence, extra_patterns=self.secret_patterns)
+        clean_constraints, _ = sanitize(constraints, extra_patterns=self.secret_patterns)
+        now = self._now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO llm_reviews("
+                "review_id, fingerprint, input_digest, result_digest, schema_version, verdict, risk, confidence, "
+                "threats_json, intent_alignment, recommended_action, evidence_json, constraints_json, "
+                "sanitized_summary, provider, model, "
+                "model_config_digest, prompt_template_id, prompt_template_digest, base_policy_digest, "
+                "task_policy_digest, token_input, token_output, latency_ms, finish_reason, "
+                "validation_issues_json, created_at, expires_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    review_id, fingerprint, input_digest, result_digest, schema_version, verdict, risk,
+                    float(confidence), json.dumps(threats, ensure_ascii=False),
+                    intent_alignment, recommended_action,
+                    json.dumps(clean_evidence, ensure_ascii=False, default=str),
+                    json.dumps(clean_constraints, ensure_ascii=False, default=str), str(clean_summary),
+                    provider, model, model_config_digest, prompt_template_id, prompt_template_digest,
+                    base_policy_digest, task_policy_digest, token_input, token_output, int(latency_ms),
+                    finish_reason, json.dumps(validation_issues, ensure_ascii=False), now, expires_at,
+                ),
+            )
+            self._connection.execute(
+                "UPDATE llm_review_jobs SET status='completed', completed_at=?, lease_owner=NULL, "
+                "lease_expires_at=NULL, last_error_code=NULL WHERE review_id=?",
+                (now, review_id),
+            )
+            if block_approval:
+                self._connection.execute(
+                    "UPDATE approvals SET resolution_gate='blocked_by_review', "
+                    "blocked_reason_code='LLM_REVIEW_DENY' "
+                    "WHERE blocking_review_id=? AND resolution_gate='review_complete'",
+                    (review_id,),
+                )
+            else:
+                self._connection.execute(
+                    "UPDATE approvals SET resolution_gate=NULL, blocked_reason_code=NULL "
+                    "WHERE blocking_review_id=? AND resolution_gate='review_complete'",
+                    (review_id,),
+                )
+
+    def retry_llm_review(self, review_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT status FROM llm_review_jobs WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] not in {"failed", "timed_out", "invalid", "cancelled"}:
+                return self.get_llm_review(review_id)
+            self._connection.execute(
+                "UPDATE llm_review_jobs SET status='queued', next_attempt_at=NULL, completed_at=NULL, "
+                "lease_owner=NULL, lease_expires_at=NULL, last_error_code=NULL WHERE review_id=?",
+                (review_id,),
+            )
+            self._connection.execute(
+                "UPDATE approvals SET resolution_gate='review_complete', blocked_reason_code=NULL "
+                "WHERE blocking_review_id=? AND status='pending'",
+                (review_id,),
+            )
+        return self.get_llm_review(review_id)
+
+    def fail_llm_review(
+        self,
+        review_id: str,
+        error_code: str,
+        *,
+        retryable: bool,
+        max_attempts: int = 2,
+        retry_delay_seconds: int = 1,
+    ) -> str:
+        now = datetime.now(timezone.utc)
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT attempt_count FROM llm_review_jobs WHERE review_id=?",
+                (review_id,),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            if retryable and int(row["attempt_count"]) < max(1, max_attempts):
+                status = "queued"
+                next_attempt = (now + timedelta(seconds=max(0, retry_delay_seconds))).isoformat()
+                completed_at = None
+            else:
+                status = "timed_out" if error_code == "LLM_PROVIDER_TIMEOUT" else "failed"
+                next_attempt = None
+                completed_at = now.isoformat()
+            self._connection.execute(
+                "UPDATE llm_review_jobs SET status=?, next_attempt_at=?, completed_at=?, "
+                "lease_owner=NULL, lease_expires_at=NULL, last_error_code=? WHERE review_id=?",
+                (status, next_attempt, completed_at, error_code[:128], review_id),
+            )
+            if status in {"failed", "timed_out"}:
+                self._connection.execute(
+                    "UPDATE approvals SET resolution_gate='review_degraded', blocked_reason_code=? "
+                    "WHERE blocking_review_id=? AND resolution_gate='review_complete'",
+                    (error_code[:128], review_id),
+                )
+            return status
+
+    def get_llm_review_by_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
+        now = self._now()
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT r.*, j.subject_type, j.subject_id, j.session_key, j.status "
+                "FROM llm_reviews r JOIN llm_review_jobs j ON j.review_id=r.review_id "
+                "WHERE r.fingerprint=? AND r.expires_at>? AND j.status='completed'",
+                (fingerprint, now),
+            ).fetchone()
+        return self._decode_llm_review(dict(row)) if row else None
+
+    def get_active_llm_review_override(
+        self,
+        review_id: str,
+        parameter_digest: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT override_id, review_id, approval_id, parameter_digest, operator, reason, "
+                "created_at, expires_at FROM llm_review_overrides "
+                "WHERE review_id=? AND parameter_digest=? AND expires_at>? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (review_id, parameter_digest, self._now()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_llm_review(self, review_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT j.*, r.result_digest, r.schema_version, r.verdict, r.risk, r.confidence, "
+                "r.threats_json, r.intent_alignment, r.recommended_action, "
+                "r.evidence_json, r.constraints_json, r.sanitized_summary, "
+                "r.provider, r.model, r.model_config_digest, r.prompt_template_id, "
+                "r.prompt_template_digest, r.base_policy_digest, r.task_policy_digest, "
+                "r.token_input, r.token_output, r.latency_ms, r.finish_reason, "
+                "r.validation_issues_json, r.expires_at "
+                "FROM llm_review_jobs j LEFT JOIN llm_reviews r ON r.review_id=j.review_id "
+                "WHERE j.review_id=?",
+                (review_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result.pop("sanitized_input_json", None)
+        return self._decode_llm_review(result)
+
+    def list_llm_reviews(
+        self,
+        *,
+        status: str | None = None,
+        session_key: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("j.status=?")
+            params.append(status)
+        if session_key:
+            clauses.append("j.session_key=?")
+            params.append(session_key)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(min(max(limit, 1), 500))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT j.review_id, j.subject_type, j.subject_id, j.session_key, j.fingerprint, "
+                "j.status, j.priority, j.attempt_count, j.created_at, j.started_at, j.completed_at, "
+                "j.last_error_code, r.verdict, r.risk, r.confidence, r.threats_json, "
+                "r.sanitized_summary, r.provider, r.model, r.latency_ms, r.validation_issues_json "
+                "FROM llm_review_jobs j LEFT JOIN llm_reviews r ON r.review_id=j.review_id"
+                f"{where} ORDER BY j.created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decode_llm_review(dict(row)) for row in rows]
+
+    def llm_review_metrics(self) -> dict[str, Any]:
+        with self._lock:
+            status_rows = self._connection.execute(
+                "SELECT status, COUNT(*) AS count FROM llm_review_jobs GROUP BY status",
+            ).fetchall()
+            verdict_rows = self._connection.execute(
+                "SELECT verdict, COUNT(*) AS count FROM llm_reviews GROUP BY verdict",
+            ).fetchall()
+            usage = self._connection.execute(
+                "SELECT COALESCE(SUM(token_input), 0), COALESCE(SUM(token_output), 0), "
+                "COALESCE(AVG(latency_ms), 0) FROM llm_reviews",
+            ).fetchone()
+        return {
+            "jobs_by_status": {row["status"]: row["count"] for row in status_rows},
+            "reviews_by_verdict": {row["verdict"]: row["count"] for row in verdict_rows},
+            "token_input": int(usage[0]),
+            "token_output": int(usage[1]),
+            "average_latency_ms": float(usage[2]),
+        }
+
+    def _decode_llm_review(self, item: dict[str, Any]) -> dict[str, Any]:
+        for field, default in (
+            ("threats_json", []),
+            ("evidence_json", []),
+            ("constraints_json", {}),
+            ("validation_issues_json", []),
+        ):
+            if field in item:
+                item[field.removesuffix("_json")] = self._json(item.pop(field), default)
+        return item
+
+    def enqueue_task_policy_generation(
+        self,
+        *,
+        generation_id: str,
+        session_key: str,
+        draft_policy_id: str,
+        revision: int,
+        trusted_context_digest: str,
+        deterministic_draft_digest: str,
+        fingerprint: str,
+        priority: int,
+        context_document: dict[str, Any],
+        queue_capacity: int,
+    ) -> dict[str, Any] | None:
+        clean, _ = sanitize(context_document, extra_patterns=self.secret_patterns)
+        serialized = json.dumps(clean, ensure_ascii=False, separators=(",", ":"), default=str)
+        with self._lock, self._connection:
+            existing = self._connection.execute(
+                "SELECT * FROM task_policy_generation_jobs WHERE fingerprint=?",
+                (fingerprint,),
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            queued = self._connection.execute(
+                "SELECT COUNT(*) FROM task_policy_generation_jobs WHERE status IN ('queued', 'running')",
+            ).fetchone()[0]
+            if int(queued) >= max(1, queue_capacity):
+                return None
+            self._connection.execute(
+                "INSERT INTO task_policy_generation_jobs("
+                "generation_id, session_key, draft_policy_id, revision, trusted_context_digest, "
+                "deterministic_draft_digest, status, fingerprint, priority, attempt_count, "
+                "next_attempt_at, lease_owner, lease_expires_at, sanitized_context_json, "
+                "created_at, started_at, completed_at, error_code"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, NULL, NULL, NULL, ?, ?, NULL, NULL, NULL)",
+                (
+                    generation_id, session_key, draft_policy_id, int(revision),
+                    trusted_context_digest, deterministic_draft_digest, fingerprint,
+                    int(priority), serialized, self._now(),
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM task_policy_generation_jobs WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def claim_task_policy_generation(
+        self,
+        worker_id: str,
+        lease_seconds: int = 30,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        lease_expires = (now + timedelta(seconds=max(5, lease_seconds))).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE task_policy_generation_jobs SET status='queued', lease_owner=NULL, "
+                "lease_expires_at=NULL, error_code='TASK_POLICY_WORKER_LEASE_EXPIRED' "
+                "WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+                (now_text,),
+            )
+            row = self._connection.execute(
+                "SELECT generation_id FROM task_policy_generation_jobs "
+                "WHERE status='queued' AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+                "ORDER BY priority DESC, created_at ASC LIMIT 1",
+                (now_text,),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = self._connection.execute(
+                "UPDATE task_policy_generation_jobs SET status='running', lease_owner=?, "
+                "lease_expires_at=?, attempt_count=attempt_count+1, "
+                "started_at=COALESCE(started_at, ?) "
+                "WHERE generation_id=? AND status='queued'",
+                (worker_id, lease_expires, now_text, row["generation_id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = self._connection.execute(
+                "SELECT * FROM task_policy_generation_jobs WHERE generation_id=?",
+                (row["generation_id"],),
+            ).fetchone()
+        if claimed is None:
+            return None
+        result = dict(claimed)
+        result["context_document"] = self._json(result.pop("sanitized_context_json"), {})
+        return result
+
+    def record_task_policy_proposal(
+        self,
+        *,
+        generation_id: str,
+        proposal_digest: str,
+        proposal_document: dict[str, Any],
+        compiled_policy_digest: str,
+        accepted_fields: list[str],
+        rejected_fields: list[dict[str, str]],
+        uncertainties: list[str],
+        provider: str,
+        model: str,
+        prompt_template_digest: str,
+        model_config_digest: str,
+        token_input: int | None,
+        token_output: int | None,
+        latency_ms: int,
+        finish_reason: str | None,
+    ) -> None:
+        clean_proposal, _ = sanitize(proposal_document, extra_patterns=self.secret_patterns)
+        clean_rejected, _ = sanitize(rejected_fields, extra_patterns=self.secret_patterns)
+        clean_uncertainties, _ = sanitize(uncertainties, extra_patterns=self.secret_patterns)
+        now = self._now()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO task_policy_proposals("
+                "generation_id, proposal_digest, sanitized_proposal_json, compiled_policy_digest, "
+                "accepted_fields_json, rejected_fields_json, uncertainties_json, provider, model, "
+                "prompt_template_digest, model_config_digest, token_input, token_output, latency_ms, "
+                "finish_reason, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    generation_id, proposal_digest,
+                    json.dumps(clean_proposal, ensure_ascii=False, default=str),
+                    compiled_policy_digest, json.dumps(accepted_fields, ensure_ascii=False),
+                    json.dumps(clean_rejected, ensure_ascii=False, default=str),
+                    json.dumps(clean_uncertainties, ensure_ascii=False, default=str),
+                    provider, model, prompt_template_digest, model_config_digest,
+                    token_input, token_output, int(latency_ms), finish_reason, now,
+                ),
+            )
+            self._connection.execute(
+                "UPDATE task_policy_generation_jobs SET status='completed', completed_at=?, "
+                "lease_owner=NULL, lease_expires_at=NULL, error_code=NULL WHERE generation_id=?",
+                (now, generation_id),
+            )
+
+    def fail_task_policy_generation(
+        self,
+        generation_id: str,
+        error_code: str,
+        *,
+        retryable: bool,
+        max_attempts: int = 2,
+    ) -> str:
+        now = datetime.now(timezone.utc)
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT attempt_count FROM task_policy_generation_jobs WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            if retryable and int(row["attempt_count"]) < max(1, max_attempts):
+                status = "queued"
+                next_attempt = (now + timedelta(seconds=1)).isoformat()
+                completed_at = None
+            else:
+                status = "failed"
+                next_attempt = None
+                completed_at = now.isoformat()
+            self._connection.execute(
+                "UPDATE task_policy_generation_jobs SET status=?, next_attempt_at=?, completed_at=?, "
+                "lease_owner=NULL, lease_expires_at=NULL, error_code=? WHERE generation_id=?",
+                (status, next_attempt, completed_at, error_code[:128], generation_id),
+            )
+            return status
+
+    def retry_task_policy_generation(self, generation_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT status FROM task_policy_generation_jobs WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "failed":
+                self._connection.execute(
+                    "UPDATE task_policy_generation_jobs SET status='queued', next_attempt_at=NULL, "
+                    "completed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, error_code=NULL "
+                    "WHERE generation_id=?",
+                    (generation_id,),
+                )
+        return self.get_task_policy_generation(generation_id)
+
+    def get_task_policy_generation(self, generation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT j.generation_id, j.session_key, j.draft_policy_id, j.revision, "
+                "j.trusted_context_digest, j.deterministic_draft_digest, j.status, j.fingerprint, "
+                "j.priority, j.attempt_count, j.created_at, j.started_at, j.completed_at, j.error_code, "
+                "p.proposal_digest, p.sanitized_proposal_json, p.compiled_policy_digest, "
+                "p.accepted_fields_json, p.rejected_fields_json, p.uncertainties_json, "
+                "p.provider, p.model, p.prompt_template_digest, p.model_config_digest, "
+                "p.token_input, p.token_output, p.latency_ms, p.finish_reason "
+                "FROM task_policy_generation_jobs j LEFT JOIN task_policy_proposals p "
+                "ON p.generation_id=j.generation_id WHERE j.generation_id=?",
+                (generation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._decode_task_generation(dict(row))
+
+    def list_task_policy_generations(
+        self,
+        *,
+        session_key: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_key:
+            clauses.append("j.session_key=?")
+            params.append(session_key)
+        if status:
+            clauses.append("j.status=?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(min(max(limit, 1), 500))
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT j.generation_id, j.session_key, j.draft_policy_id, j.revision, j.status, "
+                "j.fingerprint, j.priority, j.attempt_count, j.created_at, j.started_at, "
+                "j.completed_at, j.error_code, p.proposal_digest, p.compiled_policy_digest, "
+                "p.accepted_fields_json, p.rejected_fields_json, p.uncertainties_json, "
+                "p.provider, p.model, p.latency_ms "
+                "FROM task_policy_generation_jobs j LEFT JOIN task_policy_proposals p "
+                "ON p.generation_id=j.generation_id"
+                f"{where} ORDER BY j.created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._decode_task_generation(dict(row)) for row in rows]
+
+    def _decode_task_generation(self, item: dict[str, Any]) -> dict[str, Any]:
+        for field, default in (
+            ("sanitized_proposal_json", None),
+            ("accepted_fields_json", []),
+            ("rejected_fields_json", []),
+            ("uncertainties_json", []),
+        ):
+            if field in item:
+                item[field.removesuffix("_json")] = self._json(item.pop(field), default)
+        return item
+
     def purge_before(self, cutoff: str) -> dict[str, int]:
         """Apply configured retention without touching policy revisions or the hash values of retained events."""
         with self._lock, self._connection:
@@ -1202,4 +1883,28 @@ class AuditStore:
             incidents = self._connection.execute("DELETE FROM service_incidents WHERE created_at<?", (cutoff,)).rowcount
             actions = self._connection.execute("DELETE FROM operator_actions WHERE created_at<?", (cutoff,)).rowcount
             diagnostics = self._connection.execute("DELETE FROM diagnostic_runs WHERE started_at<?", (cutoff,)).rowcount
-        return {"events": len(event_ids), "decisions": len(decision_ids), "incidents": incidents, "operator_actions": actions, "diagnostics": diagnostics}
+            review_overrides = self._connection.execute(
+                "DELETE FROM llm_review_overrides WHERE created_at<? OR expires_at<?",
+                (cutoff, self._now()),
+            ).rowcount
+            reviews = self._connection.execute("DELETE FROM llm_reviews WHERE created_at<?", (cutoff,)).rowcount
+            review_jobs = self._connection.execute(
+                "DELETE FROM llm_review_jobs WHERE created_at<? AND review_id NOT IN (SELECT review_id FROM llm_reviews)",
+                (cutoff,),
+            ).rowcount
+            proposals = self._connection.execute(
+                "DELETE FROM task_policy_proposals WHERE created_at<?",
+                (cutoff,),
+            ).rowcount
+            generation_jobs = self._connection.execute(
+                "DELETE FROM task_policy_generation_jobs WHERE created_at<? "
+                "AND generation_id NOT IN (SELECT generation_id FROM task_policy_proposals)",
+                (cutoff,),
+            ).rowcount
+        return {
+            "events": len(event_ids), "decisions": len(decision_ids), "incidents": incidents,
+            "operator_actions": actions, "diagnostics": diagnostics,
+            "llm_review_overrides": review_overrides,
+            "llm_reviews": reviews, "llm_review_jobs": review_jobs,
+            "task_policy_proposals": proposals, "task_policy_generation_jobs": generation_jobs,
+        }

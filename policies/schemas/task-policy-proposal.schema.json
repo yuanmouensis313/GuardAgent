@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://guardagent.local/schemas/task-policy-proposal.schema.json",
+  "title": "TaskPolicyProposalV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "objective_summary", "tools", "files", "network", "commands", "limits", "uncertainties", "evidence"],
+  "$defs": {
+    "stringList": {"type": "array", "maxItems": 100, "items": {"type": "string"}},
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_span", "supports"],
+      "properties": {
+        "input_span": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start", "end"],
+          "properties": {"start": {"type": "integer", "minimum": 0}, "end": {"type": "integer", "exclusiveMinimum": 0}}
+        },
+        "supports": {"type": "string", "pattern": "^\\$\\.[A-Za-z_][A-Za-z0-9_.\\[\\]]*$", "maxLength": 512}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "objective_summary": {"type": "string", "minLength": 1, "maxLength": 512},
+    "tools": {
+      "type": "object", "additionalProperties": false, "required": ["required", "optional", "deny"],
+      "properties": {"required": {"$ref": "#/$defs/stringList"}, "optional": {"$ref": "#/$defs/stringList"}, "deny": {"$ref": "#/$defs/stringList"}}
+    },
+    "files": {
+      "type": "object", "additionalProperties": false, "required": ["read", "write"],
+      "properties": {"read": {"$ref": "#/$defs/stringList"}, "write": {"$ref": "#/$defs/stringList"}}
+    },
+    "network": {
+      "type": "object", "additionalProperties": false, "required": ["read", "write"],
+      "properties": {"read": {"$ref": "#/$defs/stringList"}, "write": {"$ref": "#/$defs/stringList"}}
+    },
+    "commands": {
+      "type": "object", "additionalProperties": false, "required": ["allow_prefixes", "approval_categories"],
+      "properties": {"allow_prefixes": {"$ref": "#/$defs/stringList"}, "approval_categories": {"$ref": "#/$defs/stringList"}}
+    },
+    "limits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_tool_calls", "max_external_writes", "max_files_changed", "ttl_minutes"],
+      "properties": {
+        "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "max_external_writes": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "max_files_changed": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 1440}
+      }
+    },
+    "uncertainties": {"type": "array", "maxItems": 100, "items": {"type": "string"}},
+    "evidence": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/evidence"}}
+  }
+}

@@ -98,6 +98,11 @@ class TaskProvenance(BaseModel):
     origin_channel: str | None = None
     origin_sender_digest: str | None = None
     origin_is_local_operator: bool = False
+    generation_id: str | None = None
+    proposal_digest: str | None = None
+    accepted_fields: list[str] = Field(default_factory=list, max_length=500)
+    rejected_fields: list[dict[str, str]] = Field(default_factory=list, max_length=500)
+    uncertainties: list[str] = Field(default_factory=list, max_length=100)
 
 
 class TaskPolicy(BaseModel):

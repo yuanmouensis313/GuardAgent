@@ -80,6 +80,27 @@ test("pending session task policy blocks instead of using unsafe approval callba
   }
 });
 
+test("pending semantic review blocks instead of exposing an approval callback", async () => {
+  const { config, handlers } = await harness(18818);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    decision_id: crypto.randomUUID(), event_id: crypto.randomUUID(), decision: "REQUIRE_APPROVAL", risk: "high",
+    rule_ids: ["LLM-REVIEW-PENDING-001"], reason: "semantic review required", parameter_digest: "sha256:test",
+    approval_id: crypto.randomUUID(), review_id: crypto.randomUUID(), review_status: "queued",
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+  try {
+    const result = await handlers.get("before_tool_call")!(
+      { toolName: "exec", params: { command: "python generated.py" } },
+      { pluginConfig: config, agentId: "main", sessionKey: "pending-review" },
+    ) as Record<string, unknown>;
+    assert.equal(result.block, true);
+    assert.equal(result.requireApproval, undefined);
+    assert.match(String(result.blockReason), /semantic review=queued/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("before_tool_call returns service-rewritten parameters", async () => {
   const { config, handlers } = await harness(18809);
   const originalFetch = globalThis.fetch;

@@ -25,12 +25,14 @@ policy_app = typer.Typer(help="Policy validation and simulation")
 task_policy_app = typer.Typer(help="Session task policy inspection and confirmation")
 sanitization_app = typer.Typer(help="Data-path sanitization inspection and tests")
 inspections_app = typer.Typer(help="Skill and MCP content inspection management")
+llm_app = typer.Typer(help="LLM safety review operations")
 app.add_typer(events_app, name="events")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(policy_app, name="policy")
 app.add_typer(task_policy_app, name="task-policy")
 app.add_typer(sanitization_app, name="sanitization")
 app.add_typer(inspections_app, name="inspections")
+app.add_typer(llm_app, name="llm")
 
 
 def _settings() -> Settings:
@@ -120,6 +122,74 @@ def allow_once(approval_id: UUID) -> None:
 @approvals_app.command("deny")
 def deny(approval_id: UUID) -> None:
     _resolve(approval_id, "deny")
+
+
+@approvals_app.command("override-review-block")
+def override_review_block(
+    approval_id: UUID,
+    digest: str = typer.Option(..., "--digest", help="Exact sha256 parameter digest"),
+    reason: str = typer.Option(..., "--reason", help="Audited security override rationale"),
+    confirmation: str = typer.Option(..., "--confirm", help="Must be OVERRIDE_LLM_DENY"),
+) -> None:
+    with _client() as client:
+        settings = _settings()
+        override_token = ensure_token(settings.security_override_token_path)
+        response = client.post(
+            f"/v1/approvals/{approval_id}/override-review-block",
+            headers={"X-Guard-Security-Override": override_token},
+            json={
+                "schema_version": "1.0", "request_id": f"guardctl-override-{uuid4()}",
+                "operator": "local-terminal", "parameter_digest": digest,
+                "reason": reason, "confirmation": confirmation,
+            },
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@llm_app.command("health")
+def llm_health() -> None:
+    with _client() as client:
+        response = client.get("/v1/llm/health")
+        response.raise_for_status()
+        _print(response.json())
+
+
+@llm_app.command("reviews")
+def llm_reviews(
+    status: str | None = typer.Option(None, "--status"),
+    session: str | None = typer.Option(None, "--session"),
+    limit: int = typer.Option(100, "--limit", min=1, max=500),
+) -> None:
+    with _client() as client:
+        response = client.get(
+            "/v1/llm-reviews",
+            params={"review_status": status, "session_key": session, "limit": limit},
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@llm_app.command("review-event")
+def review_event(event_id: UUID) -> None:
+    with _client() as client:
+        response = client.post(
+            f"/v1/events/{event_id}/review",
+            json={"schema_version": "1.0", "request_id": f"guardctl-review-{uuid4()}", "operator": "local-terminal"},
+        )
+        response.raise_for_status()
+        _print(response.json())
+
+
+@llm_app.command("retry")
+def retry_llm_review(review_id: UUID) -> None:
+    with _client() as client:
+        response = client.post(
+            f"/v1/llm-reviews/{review_id}/retry",
+            json={"schema_version": "1.0", "request_id": f"guardctl-review-retry-{uuid4()}", "operator": "local-terminal"},
+        )
+        response.raise_for_status()
+        _print(response.json())
 
 
 @policy_app.command("validate")

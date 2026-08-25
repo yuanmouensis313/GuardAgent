@@ -9,13 +9,14 @@ const Events = lazy(() => import("./pages/Events"));
 const Sessions = lazy(() => import("./pages/Sessions"));
 const Sanitization = lazy(() => import("./pages/Sanitization"));
 const Inspections = lazy(() => import("./pages/Inspections"));
+const Reviews = lazy(() => import("./pages/Reviews"));
 const Policy = lazy(() => import("./pages/Policy"));
 const Diagnostics = lazy(() => import("./pages/Diagnostics"));
 const Settings = lazy(() => import("./pages/Settings"));
 
 const nav = [
   ["/overview", "总览", "⌂"], ["/approvals", "审批中心", "!"], ["/events", "事件中心", "◎"],
-  ["/sessions", "会话", "⋮"], ["/inspections", "内容核查", "⌕"], ["/sanitization", "脱敏观测", "◇"], ["/policy", "策略", "{}"], ["/diagnostics", "系统诊断", "+"], ["/settings", "设置", "·"]
+  ["/sessions", "会话", "⋮"], ["/reviews", "模型审查", "※"], ["/inspections", "内容核查", "⌕"], ["/sanitization", "脱敏观测", "◇"], ["/policy", "策略", "{}"], ["/diagnostics", "系统诊断", "+"], ["/settings", "设置", "·"]
 ] as const;
 
 function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => void }) {
@@ -44,8 +45,10 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
       void client.invalidateQueries({ queryKey: ["task-policy"] });
       void client.invalidateQueries({ queryKey: ["sanitization"] });
       void client.invalidateQueries({ queryKey: ["inspections"] });
+      void client.invalidateQueries({ queryKey: ["llm-reviews"] });
+      void client.invalidateQueries({ queryKey: ["task-policy-generations"] });
     };
-    ["approval.created", "approval.resolved", "approval.expired", "event.recorded", "decision.recorded", "policy.reloaded", "task_policy.candidate", "task_policy.activated", "task_policy.rejected", "task_policy.closed", "sanitization.recorded", "inspection.updated", "incident.created", "diagnostic.completed"].forEach(name => stream.addEventListener(name, refresh));
+    ["approval.created", "approval.resolved", "approval.expired", "event.recorded", "decision.recorded", "policy.reloaded", "task_policy.candidate", "task_policy.activated", "task_policy.rejected", "task_policy.closed", "task_policy.generation_queued", "task_policy.hybrid_candidate", "llm_review.queued", "sanitization.recorded", "inspection.updated", "incident.created", "diagnostic.completed"].forEach(name => stream.addEventListener(name, refresh));
     return () => stream.close();
   }, [client]);
 
@@ -62,6 +65,7 @@ function Shell({ session, onLogout }: { session: SessionInfo; onLogout: () => vo
         <Route path="/approvals" element={<Approvals />} />
         <Route path="/events" element={<Events />} />
         <Route path="/sessions" element={<Sessions />} />
+        <Route path="/reviews" element={<Reviews />} />
         <Route path="/sanitization" element={<Sanitization />} />
         <Route path="/inspections" element={<Inspections />} />
         <Route path="/policy" element={<Policy />} />

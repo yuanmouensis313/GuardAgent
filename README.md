@@ -9,6 +9,8 @@ GuardAgent is a local, deterministic policy service and typed OpenClaw plugin fo
 - Fail-closed degraded behavior when the local policy service is unavailable.
 - Secret redaction, correlation controls, single-use approvals, and hash-chained SQLite audit records.
 - Session-scoped `R_task` policies with digest-bound confirmation, safe revisions, limits, and child-session inheritance.
+- Optional asynchronous LLM safety-review agent with strict structured output, evidence validation, circuit breaking, cache/lease jobs, and a fusion rule that can only tighten deterministic decisions.
+- Optional hybrid `R_task` generation: the model proposes against aliases and trusted H0 input; a deterministic compiler rejects unsupported expansion before operator activation.
 - Synchronous inbound/outbound data-path sanitization with execution transformation plans and sanitization audit.
 - Digest-bound Skill and MCP descriptor inspection; a fail-closed stdio MCP proxy removes rejected descriptors before model visibility.
 - Local Chinese web console for live approvals, event/session review, policy simulation and publishing, and diagnostics.
@@ -16,19 +18,40 @@ GuardAgent is a local, deterministic policy service and typed OpenClaw plugin fo
 
 ## Quick start
 
-Prerequisites are Python 3.12 or newer and Node.js 22 or newer.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run this command from the repository root:
+
+```powershell
+uv run guardagent
+```
+
+On the first run, uv selects Python 3.12, creates `.venv`, and installs the locked runtime dependencies. GuardAgent validates the policy, initializes its protected local state, and starts the API plus the packaged web console on `127.0.0.1:8787`.
+
+Keep the server terminal open. In a second terminal, inspect the service or securely open the console:
+
+```powershell
+uv run guardctl status
+uv run guardctl ui
+```
+
+Run the startup command from another directory only when `GUARD_AGENT_POLICY` and `GUARD_AGENT_WORKSPACE` point to the intended absolute paths. Node.js 22 or newer is needed only when changing or rebuilding the OpenClaw plugin or web-console source; it is not required to serve the packaged console.
+
+The existing editable-install workflow remains supported when uv is unavailable:
 
 ```powershell
 python -m pip install -e ".[test]"
 python scripts/init_guard.py
 guardd
-guardctl status
-guardctl ui
 ```
 
-The three new controls default to Observe. Inspect them with `guardctl task-policy`,
+The deterministic control planes default to Observe and all LLM features default to disabled. Inspect them with `guardctl task-policy`,
 `guardctl sanitization`, and `guardctl inspections`; do not enable their Enforce
 modes until the deployment gates have been completed.
+
+To stage the reviewer, set `GUARD_LLM_ENABLED=true`, a model/base URL, and start with
+`GUARD_LLM_REVIEW_MODE=shadow`. Use `guardctl llm health` and `guardctl llm reviews`.
+Never start with `enforce_tighten`; follow the privacy, evaluation, and rollback gates in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). The model is not an authorization authority:
+it has no tools and cannot loosen `R_base` or a deterministic deny.
 
 The service listens on `127.0.0.1:8787` by default. The generated bearer token is stored outside the workspace by default, under the current user's GuardAgent state directory. See `docs/DEPLOYMENT.md` before enabling Enforce mode.
 
@@ -75,7 +98,8 @@ Set `GUARDD_UI_ENABLED=false` to disable the browser control plane without disab
 ## Repository layout
 
 - `guardd/`: Python policy service, API, CLI, normalization, approvals, and audit storage.
-- `guardd/task_policy/`, `guardd/sanitization/`, `guardd/inspections/`: task scope, data-path, and content-admission controls.
+- `guardd/llm/`, `guardd/agents/`: bounded model contracts, providers, validators, job workers, and decision fusion.
+- `guardd/task_policy/`, `guardd/sanitization/`, `guardd/inspections/`: task scope, hybrid compiler, data-path, and content-admission controls.
 - `guardd/mcp_proxy.py`: digest-bound stdio MCP compatibility proxy.
 - `plugins/guard-openclaw/`: typed OpenClaw plugin source, tests, and runtime build.
 - `policies/`: default policy and JSON Schemas.

@@ -227,6 +227,49 @@ def create_ui_router(
         except InspectionError as exc:
             raise HTTPException(404, detail={"code": "NOT_FOUND", "message": str(exc)}) from exc
 
+    @router.get("/llm-reviews", response_model=ItemsResponse)
+    def llm_reviews(
+        review_status: str | None = None,
+        session_key: str | None = None,
+        limit: int = 100,
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        return {
+            "items": service.list_llm_reviews(review_status, session_key, limit),
+            "server_time": _now(),
+        }
+
+    @router.get("/llm-reviews/{review_id}", response_model=ItemResponse)
+    def llm_review(
+        review_id: UUID,
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        try:
+            item = service.get_llm_review(review_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"item": item, "server_time": _now()}
+
+    @router.post("/llm-reviews/{review_id}/retry", response_model=ItemResponse)
+    def retry_llm_review(
+        review_id: UUID,
+        body: OperatorRequest,
+        current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            item = service.retry_llm_review(review_id, current.operator)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"item": item, "server_time": _now()}
+
+    @router.get("/llm/health", response_model=ItemResponse)
+    def llm_health(_: UiSession = Depends(session)) -> dict[str, Any]:
+        return {"item": service.llm_health(), "server_time": _now()}
+
+    @router.get("/llm/metrics", response_model=ItemResponse)
+    def llm_metrics(_: UiSession = Depends(session)) -> dict[str, Any]:
+        return {"item": service.llm_metrics(), "server_time": _now()}
+
     @router.post("/inspections/{content_digest}/confirm", response_model=ItemResponse)
     def confirm_content_inspection(
         content_digest: str, body: InspectionConfirmationRequest,
@@ -283,6 +326,18 @@ def create_ui_router(
     def deny(approval_id: UUID, _: OperatorRequest, current: UiSession = Depends(write_session)) -> dict[str, Any]:
         return resolve_approval(approval_id, current, False)
 
+    @router.post("/events/{event_id}/review", response_model=ItemResponse)
+    def request_event_review(
+        event_id: UUID,
+        _: OperatorRequest,
+        current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            result = service.request_event_review(event_id, current.operator)
+        except ValueError as exc:
+            raise HTTPException(409, detail={"code": "LLM_REVIEW_REJECTED", "message": str(exc)}) from exc
+        return {"item": result, "server_time": _now()}
+
     @router.get("/sessions", response_model=PageResponse)
     def sessions(cursor: str | None = None, limit: int = Query(default=50, ge=1, le=200), _: UiSession = Depends(session)) -> dict[str, Any]:
         try:
@@ -320,6 +375,48 @@ def create_ui_router(
             return {"item": service.get_task_policy_view(session_key), "server_time": _now()}
         except TaskPolicyError:
             return {"item": None, "server_time": _now()}
+
+    @router.get("/sessions/{session_key}/safety-memory", response_model=ItemResponse)
+    def session_safety_memory(
+        session_key: str,
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        return {"item": service.safety_memory(session_key), "server_time": _now()}
+
+    @router.get("/task-policy-generations", response_model=ItemsResponse)
+    def task_policy_generations(
+        session_key: str | None = None,
+        generation_status: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        return {
+            "items": service.list_task_policy_generations(session_key, generation_status, limit),
+            "server_time": _now(),
+        }
+
+    @router.get("/task-policy-generations/{generation_id}", response_model=ItemResponse)
+    def task_policy_generation(
+        generation_id: UUID,
+        _: UiSession = Depends(session),
+    ) -> dict[str, Any]:
+        try:
+            item = service.get_task_policy_generation(generation_id)
+        except TaskPolicyError as exc:
+            raise HTTPException(404, detail={"code": "NOT_FOUND", "message": str(exc)}) from exc
+        return {"item": item, "server_time": _now()}
+
+    @router.post("/task-policy-generations/{generation_id}/retry", response_model=ItemResponse)
+    def retry_task_policy_generation(
+        generation_id: UUID,
+        _: OperatorRequest,
+        current: UiSession = Depends(write_session),
+    ) -> dict[str, Any]:
+        try:
+            item = service.retry_task_policy_generation(generation_id, current.operator)
+        except TaskPolicyError as exc:
+            raise HTTPException(404, detail={"code": "NOT_FOUND", "message": str(exc)}) from exc
+        return {"item": item, "server_time": _now()}
 
     @router.post("/sessions/{session_key}/task-policy/activate", response_model=ItemResponse)
     def activate_session_task_policy(
@@ -435,6 +532,21 @@ def create_ui_router(
             "sanitization_max_result_bytes": settings.sanitization_max_result_bytes,
             "content_inspection_enabled": settings.content_inspection_enabled,
             "content_inspection_mode": settings.content_inspection_mode,
+            "llm_enabled": settings.llm_enabled, "llm_provider": settings.llm_provider,
+            "llm_model": settings.llm_model, "llm_base_url": settings.llm_base_url,
+            "llm_request_timeout_ms": settings.llm_request_timeout_ms,
+            "llm_max_input_bytes": settings.llm_max_input_bytes,
+            "llm_max_output_bytes": settings.llm_max_output_bytes,
+            "llm_max_output_tokens": settings.llm_max_output_tokens,
+            "llm_max_concurrency": settings.llm_max_concurrency,
+            "llm_queue_capacity": settings.llm_queue_capacity,
+            "llm_cache_ttl_minutes": settings.llm_cache_ttl_minutes,
+            "llm_review_mode": settings.llm_review_mode,
+            "llm_review_sample_allow_rate": settings.llm_review_sample_allow_rate,
+            "llm_review_deny_confidence_threshold": settings.llm_review_deny_confidence_threshold,
+            "llm_review_approval_confidence_threshold": settings.llm_review_approval_confidence_threshold,
+            "task_policy_synthesizer": settings.task_policy_synthesizer,
+            "task_policy_model_timeout_ms": settings.task_policy_model_timeout_ms,
         }
         sources = {
             "host": "GUARDD_HOST", "port": "GUARDD_PORT", "workspace": "GUARD_AGENT_WORKSPACE",
@@ -448,6 +560,21 @@ def create_ui_router(
             "sanitization_max_result_bytes": "GUARD_SANITIZATION_MAX_RESULT_BYTES",
             "content_inspection_enabled": "GUARD_CONTENT_INSPECTION_ENABLED",
             "content_inspection_mode": "GUARD_CONTENT_INSPECTION_MODE",
+            "llm_enabled": "GUARD_LLM_ENABLED", "llm_provider": "GUARD_LLM_PROVIDER",
+            "llm_model": "GUARD_LLM_MODEL", "llm_base_url": "GUARD_LLM_BASE_URL",
+            "llm_request_timeout_ms": "GUARD_LLM_REQUEST_TIMEOUT_MS",
+            "llm_max_input_bytes": "GUARD_LLM_MAX_INPUT_BYTES",
+            "llm_max_output_bytes": "GUARD_LLM_MAX_OUTPUT_BYTES",
+            "llm_max_output_tokens": "GUARD_LLM_MAX_OUTPUT_TOKENS",
+            "llm_max_concurrency": "GUARD_LLM_MAX_CONCURRENCY",
+            "llm_queue_capacity": "GUARD_LLM_QUEUE_CAPACITY",
+            "llm_cache_ttl_minutes": "GUARD_LLM_CACHE_TTL_MINUTES",
+            "llm_review_mode": "GUARD_LLM_REVIEW_MODE",
+            "llm_review_sample_allow_rate": "GUARD_LLM_REVIEW_SAMPLE_ALLOW_RATE",
+            "llm_review_deny_confidence_threshold": "GUARD_LLM_REVIEW_DENY_CONFIDENCE",
+            "llm_review_approval_confidence_threshold": "GUARD_LLM_REVIEW_APPROVAL_CONFIDENCE",
+            "task_policy_synthesizer": "GUARD_TASK_POLICY_SYNTHESIZER",
+            "task_policy_model_timeout_ms": "GUARD_TASK_POLICY_MODEL_TIMEOUT_MS",
         }
         return {"item": item, "sources": sources, "restart_required": True, "server_time": _now()}
 

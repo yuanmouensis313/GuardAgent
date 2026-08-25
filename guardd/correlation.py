@@ -5,8 +5,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from guardd.llm.models import (
+    MemoryActionSummary,
+    MemorySensitiveAccess,
+    SafetyMemorySnapshot,
+)
 from guardd.models.events import GuardEvent
-from guardd.security import contains_sensitive_path, digest_payload
+from guardd.security import contains_sensitive_path, digest_payload, hmac_digest_payload
 
 
 @dataclass
@@ -133,6 +138,59 @@ class CorrelationEngine:
             state.subagents += 1
         elif event.event_type == "subagent.ended":
             state.subagents = max(0, state.subagents - 1)
+
+    def safety_memory(
+        self,
+        session_key: str,
+        hmac_key: bytes,
+        *,
+        active_task_policy_digest: str | None = None,
+    ) -> SafetyMemorySnapshot:
+        state = self._state(session_key)
+        now = datetime.now(timezone.utc)
+        recent_actions = [
+            MemoryActionSummary(
+                action="tool_call",
+                target_class=f"signature:{signature[-16:]}",
+                result="observed",
+                age_seconds=max(0, int((now - occurred).total_seconds())),
+            )
+            for occurred, signature in list(state.calls)[-20:]
+            if occurred <= now
+        ]
+        sensitive_access = [
+            MemorySensitiveAccess(
+                classification="sensitive_path",
+                target_digest=hmac_digest_payload(path, hmac_key),
+                age_seconds=max(0, int((now - occurred).total_seconds())),
+            )
+            for occurred, path in list(state.sensitive_reads)[-20:]
+            if occurred <= now
+        ]
+        denied_patterns = [
+            f"signature:{signature[-16:]}"
+            for occurred, signature in list(state.denied_signatures)[-50:]
+            if occurred <= now
+        ]
+        return SafetyMemorySnapshot(
+            session_key=session_key,
+            snapshot_at=now,
+            active_task_policy_digest=active_task_policy_digest,
+            counters={
+                "tool_calls": len(state.call_times),
+                "failures": sum(state.failures.values()),
+                "denials": len(state.denied_signatures),
+                "subagents": state.subagents,
+                "read_bytes": state.read_bytes,
+                "write_bytes": state.write_bytes,
+                "delete_bytes": state.delete_bytes,
+                "upload_bytes": state.upload_bytes,
+            },
+            recent_actions=recent_actions,
+            sensitive_access=sensitive_access,
+            denied_patterns=denied_patterns,
+            risk_score=state.risk_score,
+        )
 
     def _signature(self, event: GuardEvent) -> str:
         return digest_payload({

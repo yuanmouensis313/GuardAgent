@@ -38,9 +38,11 @@ Review the new control planes before changing modes:
 guardctl task-policy show --session <hashed-session>
 guardctl sanitization events
 guardctl inspections list
+guardctl llm health
+guardctl llm reviews
 ```
 
-`init_guard.py` creates a random bearer token. Do not copy the token into OpenClaw config or logs; configure only its file path. On Windows, restrict the state directory and token using the current user's ACL. On POSIX, the initializer applies mode `0700` to the state directory and `0600` to the token where supported.
+`init_guard.py` creates a random service bearer token and a separate security-override token. Do not copy either token into OpenClaw config or logs; configure the plugin with only the ordinary service token file. The override token is read only by local `guardctl` security-override operations and is not made available to the plugin or browser. On Windows, restrict the state directory and tokens using the current user's ACL. On POSIX, the initializer applies mode `0700` to the state directory and `0600` to the tokens where supported.
 
 ## 3. Build and install the plugin
 
@@ -82,6 +84,43 @@ Do not enter Enforce mode if any of these show sandbox disabled, host/root/home 
 
 Policy changes are schema-validated before loading. An invalid update does not replace the currently loaded policy. Back up OpenClaw config, GuardAgent policy, and the SQLite state before each transition.
 
+### LLM reviewer and hybrid task-policy rollout
+
+LLM integration is disabled by default. Configure it only from the trusted operator environment; the API key is read from the environment variable named by `GUARD_LLM_API_KEY_ENV` (default `GUARD_LLM_API_KEY`) and is never returned by status, capabilities, API, or UI.
+
+Minimum reviewer configuration:
+
+```powershell
+$env:GUARD_LLM_ENABLED="true"
+$env:GUARD_LLM_BASE_URL="https://approved-provider.example/v1"
+$env:GUARD_LLM_MODEL="<approved-structured-output-model>"
+$env:GUARD_LLM_API_KEY="<secret-from-operator-secret-store>"
+$env:GUARD_LLM_REVIEW_MODE="shadow"
+guardd
+guardctl llm health
+```
+
+Plain HTTP is accepted only for loopback local-model endpoints. For a remote provider, complete data-processing/privacy approval and confirm that GuardAgent's summary-only context is acceptable. Never place bearer tokens, HMAC keys, system prompts, environment dumps, raw tool results, or raw host paths in provider configuration or prompts.
+
+Roll out in this order:
+
+1. `disabled` baseline and deterministic regression suite.
+2. `shadow`, review quality/latency/queue/cache monitoring, canary leak tests, and manual false-positive labeling.
+3. `advisory`, displaying evidence without changing execution.
+4. `enforce_tighten` only after the documented thresholds and target-host tests pass.
+5. `GUARD_TASK_POLICY_SYNTHESIZER=hybrid` only after reviewer rollout; generated policies remain candidates requiring deterministic compilation and operator confirmation unless they are provable narrowing revisions.
+
+The model has no tools and cannot allow a deterministic deny. A required review blocks the first exact attempt until completion. High-confidence enforceable deny results block ordinary allow-once. A local security operator may release only that review gate with an exact parameter digest, a reason, and explicit confirmation. The blocked approval is closed as `review_overridden`; retrying the exact action creates a new one-time approval and never directly allows execution:
+
+```powershell
+guardctl approvals override-review-block <approval-uuid> `
+  --digest sha256:<64-hex> `
+  --reason "Locally reproduced and confirmed a reviewer false positive" `
+  --confirm OVERRIDE_LLM_DENY
+```
+
+To roll back immediately, set `GUARD_LLM_REVIEW_MODE=disabled` and `GUARD_TASK_POLICY_SYNTHESIZER=deterministic`, then restart `guardd`. Preserve review/generation/audit records. Do not delete tables or reuse stale candidates. Provider key rotation requires replacing the secret in the operator secret store and restarting `guardd`; verify `guardctl llm health` without printing the key.
+
 ### MCP servers
 
 OpenClaw does not currently provide GuardAgent with an authoritative descriptor-registration hook. Route every protected stdio MCP server through the local compatibility proxy so descriptor filtering happens before the descriptor reaches the model:
@@ -105,6 +144,9 @@ guardctl events list --session <hashed-session>
 guardctl approvals list
 guardctl approvals allow-once <uuid>
 guardctl approvals deny <uuid>
+guardctl llm health
+guardctl llm reviews
+guardctl llm review-event <event-uuid>
 guardctl policy simulate fixtures/deny/root-delete-posix.json
 guardctl policy test fixtures/deny/root-delete-posix.json
 guardctl replay --session <hashed-session>
@@ -129,6 +171,8 @@ Set `GUARDD_UI_ENABLED=false` before starting `guardd` to disable the browser co
 - SQLite write failure: high-risk decisions fail closed. Critical/deny audit records fall back to the protected emergency JSONL.
 - Policy parse failure: the last valid in-memory policy remains active. If there is no valid startup policy, `guardd` refuses to start.
 - Missing approval UI, timeout, malformed resolution, restart, or missing record: deny.
+- LLM timeout/schema failure/circuit open: deterministic decisions remain authoritative; required reviews stay gated or become `review_degraded` for operator handling, and hybrid generation retains the deterministic candidate.
+- LLM queue full: sampled/optional reviews degrade without granting access; required reviews remain blocked in `enforce_tighten`.
 
 ## 8. Rollback and break-glass
 
@@ -149,5 +193,7 @@ Emergency break-glass may disable the plugin only while the Gateway is stopped a
 - Pending approvals after restart: they are intentionally invalid; list and deny/expire them.
 - SQLite contention: confirm WAL and `busy_timeout`, ensure no monitored-agent mount includes the state directory, and run an integrity check through `guardctl status`.
 - Install policy blocks an intended package: pin an exact version, add only its exact target name to `GUARD_INSTALL_ALLOWLIST`, rerun deep doctor, and remove temporary trust after installation.
+- LLM reviews remain queued: inspect `guardctl llm health`, circuit-breaker state, provider reachability, queue depth, and retry a terminal job with `guardctl llm retry <review-uuid>`.
+- Hybrid candidate is missing: inspect the generation record in the session UI; model failure intentionally leaves the deterministic candidate in place. Full trusted prompts are never persisted, so after a `guardd` restart recapture the trusted task instead of retrying a generation whose in-memory context is unavailable.
 
 Audit retention defaults to 30 days as configuration metadata; production scheduling for database backup/retention must run outside OpenClaw. Never let the monitored agent rotate or delete GuardAgent logs.
