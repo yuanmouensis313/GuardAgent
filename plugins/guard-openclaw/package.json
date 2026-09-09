@@ -19,7 +19,7 @@
     "openclaw": ">=2026.5.27"
   },
   "devDependencies": {
-    "openclaw": "2026.7.1",
+    "openclaw": "2026.9.2",
     "tsx": "4.23.1",
     "typescript": "5.9.3",
     "@types/node": "24.0.0"
